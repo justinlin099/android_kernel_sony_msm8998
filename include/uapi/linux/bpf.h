@@ -92,6 +92,13 @@ enum bpf_map_type {
 	BPF_MAP_TYPE_PERCPU_ARRAY,
 	BPF_MAP_TYPE_STACK_TRACE,
 	BPF_MAP_TYPE_CGROUP_ARRAY,
+	/* Map IDs 9 and 10 are reserved for the upstream LRU map types. */
+	BPF_MAP_TYPE_LPM_TRIE = 11,
+};
+
+struct bpf_lpm_trie_key {
+	__u32 prefixlen;
+	__u8 data[0];
 };
 
 enum bpf_prog_type {
