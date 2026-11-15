@@ -15,6 +15,7 @@
 #include <linux/vmacache.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
+#include <linux/shmem_fs.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
 #include <linux/syscalls.h>
@@ -1646,6 +1647,13 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 
 		if (!may_expand_vm(mm, (len >> PAGE_SHIFT) - nr_pages))
 			return -ENOMEM;
+	}
+
+	/* Apply shmem seals before an existing VMA can absorb this mapping. */
+	if (file) {
+		error = shmem_check_seals_mmap(file, &vm_flags);
+		if (error)
+			return error;
 	}
 
 	/* Clear old maps */

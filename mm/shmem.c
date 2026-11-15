@@ -1500,7 +1500,7 @@ shmem_write_begin(struct file *file, struct address_space *mapping,
 
 	/* i_mutex is held by caller */
 	if (unlikely(info->seals)) {
-		if (info->seals & F_SEAL_WRITE)
+		if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE))
 			return -EPERM;
 		if ((info->seals & F_SEAL_GROW) && pos + len > inode->i_size)
 			return -EPERM;
@@ -1959,7 +1959,8 @@ continue_resched:
 #define F_ALL_SEALS (F_SEAL_SEAL | \
 		     F_SEAL_SHRINK | \
 		     F_SEAL_GROW | \
-		     F_SEAL_WRITE)
+		     F_SEAL_WRITE | \
+		     F_SEAL_FUTURE_WRITE)
 
 int shmem_add_seals(struct file *file, unsigned int seals)
 {
@@ -2037,9 +2038,29 @@ int shmem_get_seals(struct file *file)
 	if (file->f_op != &shmem_file_operations)
 		return -EINVAL;
 
-	return SHMEM_I(file_inode(file))->seals;
+	return READ_ONCE(SHMEM_I(file_inode(file))->seals);
 }
 EXPORT_SYMBOL_GPL(shmem_get_seals);
+
+int shmem_check_seals_mmap(struct file *file, unsigned long *vm_flags)
+{
+	int seals;
+
+	/* MAP_PRIVATE mappings must retain copy-on-write permissions. */
+	if (!(*vm_flags & VM_SHARED))
+		return 0;
+
+	seals = shmem_get_seals(file);
+	if (seals < 0 || !(seals & F_SEAL_FUTURE_WRITE))
+		return 0;
+
+	if (*vm_flags & VM_WRITE)
+		return -EPERM;
+
+	/* mprotect() must not make this new shared mapping writable. */
+	*vm_flags &= ~VM_MAYWRITE;
+	return 0;
+}
 
 long shmem_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
 {
@@ -2086,7 +2107,7 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 		DECLARE_WAIT_QUEUE_HEAD_ONSTACK(shmem_falloc_waitq);
 
 		/* protected by i_mutex */
-		if (info->seals & F_SEAL_WRITE) {
+		if (info->seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) {
 			error = -EPERM;
 			goto out;
 		}
