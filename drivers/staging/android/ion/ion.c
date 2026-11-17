@@ -17,6 +17,7 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/compat.h>
 #include <linux/err.h>
 #include <linux/file.h>
 #include <linux/freezer.h>
@@ -58,6 +59,10 @@
  */
 struct ion_device {
 	struct miscdevice dev;
+#ifdef CONFIG_ION_IMPORT_DEVICE
+	struct miscdevice import_dev;
+	bool import_registered;
+#endif
 	struct rb_root buffers;
 	struct mutex buffer_lock;
 	struct rw_semaphore lock;
@@ -1717,11 +1722,14 @@ static long ion_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			handle = pass_to_user(handle);
 			if (IS_ERR(handle)) {
 				ret = PTR_ERR(handle);
-				data.handle.handle = 0;
+			} else if (copy_to_user((void __user *)arg, &data.fd,
+						 sizeof(data.fd))) {
+				user_ion_free_nolock(client, handle);
+				ret = -EFAULT;
 			}
 		}
 		mutex_unlock(&client->lock);
-		break;
+		return ret;
 	}
 	case ION_IOC_SYNC:
 	{
@@ -1773,10 +1781,8 @@ static int ion_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int ion_open(struct inode *inode, struct file *file)
+static int ion_open_client(struct ion_device *dev, struct file *file)
 {
-	struct miscdevice *miscdev = file->private_data;
-	struct ion_device *dev = container_of(miscdev, struct ion_device, dev);
 	struct ion_client *client;
 	char debug_name[64];
 
@@ -1789,6 +1795,14 @@ static int ion_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int ion_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *miscdev = file->private_data;
+
+	return ion_open_client(container_of(miscdev, struct ion_device, dev),
+			       file);
+}
+
 static const struct file_operations ion_fops = {
 	.owner          = THIS_MODULE,
 	.open           = ion_open,
@@ -1796,6 +1810,48 @@ static const struct file_operations ion_fops = {
 	.unlocked_ioctl = ion_ioctl,
 	.compat_ioctl   = compat_ion_ioctl,
 };
+
+#ifdef CONFIG_ION_IMPORT_DEVICE
+static int ion_import_open(struct inode *inode, struct file *file)
+{
+	struct miscdevice *miscdev = file->private_data;
+
+	return ion_open_client(container_of(miscdev, struct ion_device,
+					    import_dev), file);
+}
+
+static long ion_import_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
+{
+	/* The caller can reference only ION buffers it already holds as fds. */
+	switch (cmd) {
+	case ION_IOC_IMPORT:
+	case ION_IOC_FREE:
+		return ion_ioctl(file, cmd, arg);
+	default:
+		return -ENOTTY;
+	}
+}
+
+#ifdef CONFIG_COMPAT
+static long ion_import_compat_ioctl(struct file *file, unsigned int cmd,
+				    unsigned long arg)
+{
+	/* Both permitted commands contain only 32-bit fields. */
+	return ion_import_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+
+static const struct file_operations ion_import_fops = {
+	.owner		= THIS_MODULE,
+	.open		= ion_import_open,
+	.release	= ion_release,
+	.unlocked_ioctl	= ion_import_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= ion_import_compat_ioctl,
+#endif
+};
+#endif
 
 static size_t ion_debug_heap_total(struct ion_client *client,
 				   unsigned int id)
@@ -2186,12 +2242,27 @@ debugfs_done:
 	idev->clients = RB_ROOT;
 	ion_root_client = &idev->clients;
 	mutex_init(&debugfs_mutex);
+
+#ifdef CONFIG_ION_IMPORT_DEVICE
+	idev->import_dev.minor = MISC_DYNAMIC_MINOR;
+	idev->import_dev.name = "ion-import";
+	idev->import_dev.fops = &ion_import_fops;
+	ret = misc_register(&idev->import_dev);
+	if (ret)
+		pr_err("ion: failed to register import device: %d\n", ret);
+	else
+		idev->import_registered = true;
+#endif
 	return idev;
 }
 EXPORT_SYMBOL(ion_device_create);
 
 void ion_device_destroy(struct ion_device *dev)
 {
+#ifdef CONFIG_ION_IMPORT_DEVICE
+	if (dev->import_registered)
+		misc_deregister(&dev->import_dev);
+#endif
 	misc_deregister(&dev->dev);
 	debugfs_remove_recursive(dev->debug_root);
 	/* XXX need to free the heaps and clients ? */

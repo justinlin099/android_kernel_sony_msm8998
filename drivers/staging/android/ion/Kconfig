@@ -10,6 +10,13 @@ menuconfig ION
 	  If you're not using Android its probably safe to
 	  say N here.
 
+config ION_IMPORT_DEVICE
+	bool "Separate ION buffer import device"
+	depends on ION
+	help
+	  Provide /dev/ion-import for importing existing ION dma-buf file
+	  descriptors and releasing handles belonging to the same client.
+
 config ION_TEST
 	tristate "Ion Test Device"
 	depends on ION
