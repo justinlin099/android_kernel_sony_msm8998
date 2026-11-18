@@ -48,6 +48,10 @@
 #include "ion_priv.h"
 #include "compat_ion.h"
 
+#ifdef CONFIG_ION_IMPORT_DEVICE
+#include <uapi/linux/ion_import.h>
+#endif
+
 /**
  * struct ion_device - the metadata of the ion device node
  * @dev:		the actual misc device
@@ -1820,6 +1824,53 @@ static int ion_import_open(struct inode *inode, struct file *file)
 					    import_dev), file);
 }
 
+static long ion_import_cache(struct ion_client *client, unsigned long arg)
+{
+	struct ion_import_cache_data data;
+	struct ion_handle *handle;
+	struct ion_buffer *buffer;
+	unsigned int op;
+	long ret;
+
+	if (copy_from_user(&data, (void __user *)arg, sizeof(data)))
+		return -EFAULT;
+
+	switch (data.op) {
+	case ION_IMPORT_CACHE_CLEAN:
+		op = ION_IOC_CLEAN_CACHES;
+		break;
+	case ION_IMPORT_CACHE_INVALIDATE:
+		op = ION_IOC_INV_CACHES;
+		break;
+	case ION_IMPORT_CACHE_CLEAN_INVALIDATE:
+		op = ION_IOC_CLEAN_INV_CACHES;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	mutex_lock(&client->lock);
+	handle = ion_handle_get_by_id_nolock(client, data.handle);
+	if (IS_ERR(handle)) {
+		ret = PTR_ERR(handle);
+		goto out_unlock;
+	}
+
+	/* Use the buffer's own pages and extent, never a userspace address. */
+	buffer = handle->buffer;
+	ret = -EINVAL;
+	if (!(buffer->flags & ION_FLAG_SECURE) &&
+	    get_secure_vmid(buffer->flags) <= 0 && buffer->size <= UINT_MAX &&
+	    !IS_ERR_OR_NULL(buffer->sg_table) && buffer->sg_table->sgl &&
+	    sg_page(buffer->sg_table->sgl))
+		ret = ion_do_cache_op(client, handle, NULL, 0, buffer->size, op);
+	ion_handle_put_nolock(handle);
+
+out_unlock:
+	mutex_unlock(&client->lock);
+	return ret;
+}
+
 static long ion_import_ioctl(struct file *file, unsigned int cmd,
 			     unsigned long arg)
 {
@@ -1828,6 +1879,8 @@ static long ion_import_ioctl(struct file *file, unsigned int cmd,
 	case ION_IOC_IMPORT:
 	case ION_IOC_FREE:
 		return ion_ioctl(file, cmd, arg);
+	case ION_IOC_IMPORT_CACHE:
+		return ion_import_cache(file->private_data, arg);
 	default:
 		return -ENOTTY;
 	}
@@ -1837,7 +1890,7 @@ static long ion_import_ioctl(struct file *file, unsigned int cmd,
 static long ion_import_compat_ioctl(struct file *file, unsigned int cmd,
 				    unsigned long arg)
 {
-	/* Both permitted commands contain only 32-bit fields. */
+	/* All permitted commands contain only 32-bit fields. */
 	return ion_import_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
 }
 #endif

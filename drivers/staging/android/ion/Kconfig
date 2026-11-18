@@ -12,10 +12,11 @@ menuconfig ION
 
 config ION_IMPORT_DEVICE
 	bool "Separate ION buffer import device"
-	depends on ION
+	depends on ION_MSM = y
 	help
 	  Provide /dev/ion-import for importing existing ION dma-buf file
-	  descriptors and releasing handles belonging to the same client.
+	  descriptors, synchronizing non-secure page-backed buffers, and
+	  releasing handles belonging to the same client.
 
 config ION_TEST
 	tristate "Ion Test Device"
