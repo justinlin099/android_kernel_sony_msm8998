@@ -270,11 +270,15 @@ static const char *const bpf_jmp_string[16] = {
 	[BPF_JA >> 4]   = "jmp",
 	[BPF_JEQ >> 4]  = "==",
 	[BPF_JGT >> 4]  = ">",
+	[BPF_JLT >> 4]  = "<",
 	[BPF_JGE >> 4]  = ">=",
+	[BPF_JLE >> 4]  = "<=",
 	[BPF_JSET >> 4] = "&",
 	[BPF_JNE >> 4]  = "!=",
 	[BPF_JSGT >> 4] = "s>",
+	[BPF_JSLT >> 4] = "s<",
 	[BPF_JSGE >> 4] = "s>=",
+	[BPF_JSLE >> 4] = "s<=",
 	[BPF_CALL >> 4] = "call",
 	[BPF_EXIT >> 4] = "exit",
 };
@@ -361,10 +365,12 @@ static void print_bpf_insn(const struct bpf_verifier_env *env,
 			verbose("BUG_ld_%02x\n", insn->code);
 			return;
 		}
-	} else if (class == BPF_JMP) {
+	} else if (class == BPF_JMP || class == BPF_JMP32) {
 		u8 opcode = BPF_OP(insn->code);
+		char reg = class == BPF_JMP32 ? 'w' : 'r';
+		const char *op = bpf_jmp_string[opcode >> 4];
 
-		if (opcode == BPF_CALL) {
+		if (insn->code == (BPF_JMP | BPF_CALL)) {
 			verbose("(%02x) call %d\n", insn->code, insn->imm);
 		} else if (insn->code == (BPF_JMP | BPF_JA)) {
 			verbose("(%02x) goto pc%+d\n",
@@ -372,14 +378,12 @@ static void print_bpf_insn(const struct bpf_verifier_env *env,
 		} else if (insn->code == (BPF_JMP | BPF_EXIT)) {
 			verbose("(%02x) exit\n", insn->code);
 		} else if (BPF_SRC(insn->code) == BPF_X) {
-			verbose("(%02x) if r%d %s r%d goto pc%+d\n",
-				insn->code, insn->dst_reg,
-				bpf_jmp_string[BPF_OP(insn->code) >> 4],
-				insn->src_reg, insn->off);
+			verbose("(%02x) if %c%d %s %c%d goto pc%+d\n",
+				insn->code, reg, insn->dst_reg, op ?: "?",
+				reg, insn->src_reg, insn->off);
 		} else {
-			verbose("(%02x) if r%d %s 0x%x goto pc%+d\n",
-				insn->code, insn->dst_reg,
-				bpf_jmp_string[BPF_OP(insn->code) >> 4],
+			verbose("(%02x) if %c%d %s 0x%x goto pc%+d\n",
+				insn->code, reg, insn->dst_reg, op ?: "?",
 				insn->imm, insn->off);
 		}
 	} else {
@@ -2231,15 +2235,85 @@ static void mark_map_regs(struct bpf_verifier_state *state, u32 regno,
 	}
 }
 
+static bool is_jmp32_cond_op(u8 opcode)
+{
+	return opcode != BPF_JA && opcode != BPF_CALL && opcode != BPF_EXIT &&
+	       opcode <= BPF_JSLE;
+}
+
+static bool jmp32_cond_taken(u8 opcode, u32 lhs, u32 rhs)
+{
+	switch (opcode) {
+	case BPF_JEQ:
+		return lhs == rhs;
+	case BPF_JNE:
+		return lhs != rhs;
+	case BPF_JGT:
+		return lhs > rhs;
+	case BPF_JGE:
+		return lhs >= rhs;
+	case BPF_JLT:
+		return lhs < rhs;
+	case BPF_JLE:
+		return lhs <= rhs;
+	case BPF_JSET:
+		return (lhs & rhs) != 0;
+	case BPF_JSGT:
+		return (s32)lhs > (s32)rhs;
+	case BPF_JSGE:
+		return (s32)lhs >= (s32)rhs;
+	case BPF_JSLT:
+		return (s32)lhs < (s32)rhs;
+	case BPF_JSLE:
+		return (s32)lhs <= (s32)rhs;
+	default:
+		return false;
+	}
+}
+
+static int check_jmp32_cond(struct bpf_verifier_env *env,
+			    const struct bpf_insn *insn, int *insn_idx)
+{
+	struct bpf_reg_state *regs = env->cur_state.regs;
+	const struct bpf_reg_state *lhs = &regs[insn->dst_reg];
+	const struct bpf_reg_state *rhs = NULL;
+
+	if (BPF_SRC(insn->code) == BPF_X)
+		rhs = &regs[insn->src_reg];
+
+	/* Low-word comparisons cannot prove pointer bounds or nullness. */
+	if ((lhs->type != CONST_IMM && lhs->type != UNKNOWN_VALUE) ||
+	    (rhs && rhs->type != CONST_IMM && rhs->type != UNKNOWN_VALUE)) {
+		verbose("JMP32 only compares scalar values\n");
+		return -EACCES;
+	}
+
+	if (lhs->type == CONST_IMM && (!rhs || rhs->type == CONST_IMM)) {
+		u32 value = rhs ? (u32)rhs->imm : (u32)insn->imm;
+
+		if (jmp32_cond_taken(BPF_OP(insn->code), (u32)lhs->imm, value))
+			*insn_idx += insn->off;
+		return 0;
+	}
+
+	/* The legacy state tracks full-width bounds. Keep both branches
+	 * without narrowing those bounds from a low-word comparison.
+	 */
+	if (!push_stack(env, *insn_idx + insn->off + 1, *insn_idx))
+		return -EFAULT;
+	return 0;
+}
+
 static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			     struct bpf_insn *insn, int *insn_idx)
 {
 	struct bpf_verifier_state *other_branch, *this_branch = &env->cur_state;
 	struct bpf_reg_state *regs = this_branch->regs, *dst_reg;
 	u8 opcode = BPF_OP(insn->code);
+	bool jmp32 = BPF_CLASS(insn->code) == BPF_JMP32;
 	int err;
 
-	if (opcode > BPF_EXIT) {
+	if (jmp32 ? !is_jmp32_cond_op(opcode) : opcode > BPF_EXIT) {
 		verbose("invalid BPF_JMP opcode %x\n", opcode);
 		return -EINVAL;
 	}
@@ -2271,6 +2345,9 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 	err = check_reg_arg(regs, insn->dst_reg, SRC_OP);
 	if (err)
 		return err;
+
+	if (jmp32)
+		return check_jmp32_cond(env, insn, insn_idx);
 
 	dst_reg = &regs[insn->dst_reg];
 
@@ -2586,9 +2663,15 @@ peek_stack:
 		goto check_state;
 	t = insn_stack[cur_stack - 1];
 
-	if (BPF_CLASS(insns[t].code) == BPF_JMP) {
+	if (BPF_CLASS(insns[t].code) == BPF_JMP ||
+	    BPF_CLASS(insns[t].code) == BPF_JMP32) {
 		u8 opcode = BPF_OP(insns[t].code);
 
+		if (BPF_CLASS(insns[t].code) == BPF_JMP32 &&
+		    !is_jmp32_cond_op(opcode)) {
+			ret = -EINVAL;
+			goto err_free;
+		}
 		if (opcode == BPF_EXIT) {
 			goto mark_explored;
 		} else if (opcode == BPF_CALL) {
@@ -3064,8 +3147,11 @@ static int do_check(struct bpf_verifier_env *env)
 			if (err)
 				return err;
 
-		} else if (class == BPF_JMP) {
+		} else if (class == BPF_JMP || class == BPF_JMP32) {
 			u8 opcode = BPF_OP(insn->code);
+
+			if (class == BPF_JMP32 && !is_jmp32_cond_op(opcode))
+				return -EINVAL;
 
 			if (opcode == BPF_CALL) {
 				if (BPF_SRC(insn->code) != BPF_K ||
