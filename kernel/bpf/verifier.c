@@ -1587,20 +1587,36 @@ static int evaluate_reg_imm_alu(struct bpf_verifier_env *env,
 	struct bpf_reg_state *dst_reg = &regs[insn->dst_reg];
 	struct bpf_reg_state *src_reg = &regs[insn->src_reg];
 	u8 opcode = BPF_OP(insn->code);
+	u64 rhs;
 
-	if (BPF_SRC(insn->code) == BPF_X && src_reg->type == UNKNOWN_VALUE)
-		return evaluate_reg_imm_alu_unknown(env, insn);
+	if (BPF_SRC(insn->code) == BPF_X) {
+		if (src_reg->type == UNKNOWN_VALUE)
+			return evaluate_reg_imm_alu_unknown(env, insn);
+		if (src_reg->type != CONST_IMM) {
+			mark_reg_unknown_value(regs, insn->dst_reg);
+			return 0;
+		}
+		rhs = (u64)src_reg->imm;
+	} else {
+		rhs = (u64)(s64)insn->imm;
+	}
 
-	/* dst_reg->type == CONST_IMM here, simulate execution of 'add' insn.
-	 * Don't care about overflow or negative values, just add them
-	 */
-	if (opcode == BPF_ADD && BPF_SRC(insn->code) == BPF_K)
-		dst_reg->imm += insn->imm;
-	else if (opcode == BPF_ADD && BPF_SRC(insn->code) == BPF_X &&
-		 src_reg->type == CONST_IMM)
-		dst_reg->imm += src_reg->imm;
-	else
+	switch (opcode) {
+	case BPF_ADD:
+		dst_reg->imm = (u64)dst_reg->imm + rhs;
+		break;
+	case BPF_AND:
+		dst_reg->imm = (u64)dst_reg->imm & rhs;
+		break;
+	case BPF_OR:
+		dst_reg->imm = (u64)dst_reg->imm | rhs;
+		break;
+	case BPF_XOR:
+		dst_reg->imm = (u64)dst_reg->imm ^ rhs;
+		break;
+	default:
 		mark_reg_unknown_value(regs, insn->dst_reg);
+	}
 	return 0;
 }
 
@@ -1750,6 +1766,62 @@ static void adjust_reg_min_max_vals(struct bpf_verifier_env *env,
 	check_reg_overflow(dst_reg);
 }
 
+static bool fold_const_alu32(u8 opcode, u32 lhs, u32 rhs, u32 *result)
+{
+	switch (opcode) {
+	case BPF_ADD:
+		*result = lhs + rhs;
+		return true;
+	case BPF_SUB:
+		*result = lhs - rhs;
+		return true;
+	case BPF_MUL:
+		*result = lhs * rhs;
+		return true;
+	case BPF_AND:
+		*result = lhs & rhs;
+		return true;
+	case BPF_OR:
+		*result = lhs | rhs;
+		return true;
+	case BPF_XOR:
+		*result = lhs ^ rhs;
+		return true;
+	case BPF_LSH:
+		if (rhs >= 32)
+			return false;
+		*result = lhs << rhs;
+		return true;
+	case BPF_RSH:
+		if (rhs >= 32)
+			return false;
+		*result = lhs >> rhs;
+		return true;
+	case BPF_DIV:
+		if (!rhs)
+			return false;
+		*result = lhs / rhs;
+		return true;
+	case BPF_MOD:
+		if (!rhs)
+			return false;
+		*result = lhs % rhs;
+		return true;
+	default:
+		return false;
+	}
+}
+
+static void mark_reg_known_alu32(struct bpf_reg_state *reg, u32 value)
+{
+	reg->type = CONST_IMM;
+	reg->id = 0;
+	reg->imm = value;
+	reg->min_value = value;
+	reg->max_value = value;
+	reg->value_from_signed = false;
+}
+
 /* check validity of 32-bit and 64-bit arithmetic operations */
 static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
@@ -1791,6 +1863,8 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			return err;
 
 	} else if (opcode == BPF_MOV) {
+		bool known_alu32 = false;
+		u32 value = 0;
 
 		if (BPF_SRC(insn->code) == BPF_X) {
 			if (insn->imm != 0 || insn->off != 0) {
@@ -1802,6 +1876,12 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			err = check_reg_arg(regs, insn->src_reg, SRC_OP);
 			if (err)
 				return err;
+
+			if (BPF_CLASS(insn->code) == BPF_ALU &&
+			    regs[insn->src_reg].type == CONST_IMM) {
+				known_alu32 = true;
+				value = (u32)regs[insn->src_reg].imm;
+			}
 		} else {
 			if (insn->src_reg != BPF_REG_0 || insn->off != 0) {
 				verbose("BPF_MOV uses reserved fields\n");
@@ -1818,6 +1898,11 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		 * reset its range values.
 		 */
 		reset_reg_range_values(regs, insn->dst_reg);
+
+		if (known_alu32) {
+			mark_reg_known_alu32(&regs[insn->dst_reg], value);
+			return 0;
+		}
 
 		if (BPF_SRC(insn->code) == BPF_X) {
 			if (BPF_CLASS(insn->code) == BPF_ALU64) {
@@ -1904,6 +1989,20 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			return err;
 
 		dst_reg = &regs[insn->dst_reg];
+
+		if (BPF_CLASS(insn->code) == BPF_ALU &&
+		    dst_reg->type == CONST_IMM) {
+			const struct bpf_reg_state *src_reg = &regs[insn->src_reg];
+			bool reg_operand = BPF_SRC(insn->code) == BPF_X;
+			u32 rhs = reg_operand ? (u32)src_reg->imm : (u32)insn->imm;
+			u32 value;
+
+			if ((!reg_operand || src_reg->type == CONST_IMM) &&
+			    fold_const_alu32(opcode, (u32)dst_reg->imm, rhs, &value)) {
+				mark_reg_known_alu32(dst_reg, value);
+				return 0;
+			}
+		}
 
 		/* first we want to adjust our ranges. */
 		adjust_reg_min_max_vals(env, insn);
@@ -2351,23 +2450,18 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 
 	dst_reg = &regs[insn->dst_reg];
 
-	/* detect if R == 0 where R was initialized to zero earlier */
-	if (BPF_SRC(insn->code) == BPF_K &&
-	    (opcode == BPF_JEQ || opcode == BPF_JNE) &&
-	    dst_reg->type == CONST_IMM && dst_reg->imm == insn->imm) {
-		if (opcode == BPF_JEQ) {
-			/* if (imm == imm) goto pc+off;
-			 * only follow the goto, ignore fall-through
-			 */
+	/* With two known scalars, only the reachable branch needs checking. */
+	if ((opcode == BPF_JEQ || opcode == BPF_JNE) &&
+	    dst_reg->type == CONST_IMM &&
+	    (BPF_SRC(insn->code) == BPF_K ||
+	     regs[insn->src_reg].type == CONST_IMM)) {
+		s64 rhs = BPF_SRC(insn->code) == BPF_K ?
+			  insn->imm : regs[insn->src_reg].imm;
+		bool equal = dst_reg->imm == rhs;
+
+		if (equal == (opcode == BPF_JEQ))
 			*insn_idx += insn->off;
-			return 0;
-		} else {
-			/* if (imm != imm) goto pc+off;
-			 * only follow fall-through branch, since
-			 * that's where the program will go
-			 */
-			return 0;
-		}
+		return 0;
 	}
 
 	other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx);
@@ -2622,8 +2716,12 @@ static int push_insn(int t, int w, int e, struct bpf_verifier_env *env)
 		insn_stack[cur_stack++] = w;
 		return 1;
 	} else if ((insn_state[w] & 0xF0) == DISCOVERED) {
-		verbose("back-edge from insn %d to %d\n", t, w);
-		return -EINVAL;
+		if (!env->allow_bounded_loops) {
+			verbose("back-edge from insn %d to %d\n", t, w);
+			return -EINVAL;
+		}
+		env->has_loop = true;
+		insn_state[t] = DISCOVERED | e;
 	} else if (insn_state[w] == EXPLORED) {
 		/* forward- or cross-edge */
 		insn_state[t] = DISCOVERED | e;
@@ -2911,6 +3009,14 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl;
 
+	/* The legacy cache considers a state safe before all of its
+	 * descendants have exited. With a loop, revisiting one of those
+	 * states cannot prove termination. Explore each path instead;
+	 * the instruction and branch limits still bound the analysis.
+	 */
+	if (env->has_loop)
+		return 0;
+
 	sl = env->explored_states[insn_idx];
 	if (!sl)
 		/* this 'insn_idx' instruction wasn't marked, so we will not
@@ -2971,7 +3077,7 @@ static int do_check(struct bpf_verifier_env *env)
 		u8 class;
 		int err;
 
-		if (insn_idx >= insn_cnt) {
+		if (insn_idx < 0 || insn_idx >= insn_cnt) {
 			verbose("invalid insn idx %d insn_cnt %d\n",
 				insn_idx, insn_cnt);
 			return -EFAULT;
@@ -3708,11 +3814,12 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr)
 	if (!env->explored_states)
 		goto skip_full_check;
 
+	env->allow_ptr_leaks = capable(CAP_SYS_ADMIN);
+	env->allow_bounded_loops = env->allow_ptr_leaks;
+
 	ret = check_cfg(env);
 	if (ret < 0)
 		goto skip_full_check;
-
-	env->allow_ptr_leaks = capable(CAP_SYS_ADMIN);
 
 	ret = do_check(env);
 
