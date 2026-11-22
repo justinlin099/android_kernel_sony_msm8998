@@ -2656,7 +2656,7 @@ static const struct bpf_func_proto bpf_get_numa_node_id_proto = {
 };
 
 static const struct bpf_func_proto *
-sk_filter_func_proto(enum bpf_func_id func_id)
+bpf_base_func_proto(enum bpf_func_id func_id)
 {
 	switch (func_id) {
 	case BPF_FUNC_map_lookup_elem:
@@ -2693,6 +2693,17 @@ sk_filter_func_proto(enum bpf_func_id func_id)
 		return &bpf_get_current_uid_gid_proto;
 	default:
 		return NULL;
+	}
+}
+
+static const struct bpf_func_proto *
+sk_filter_func_proto(enum bpf_func_id func_id)
+{
+	switch (func_id) {
+	case BPF_FUNC_skb_load_bytes:
+		return &bpf_skb_load_bytes_proto;
+	default:
+		return bpf_base_func_proto(func_id);
 	}
 }
 
@@ -2753,7 +2764,7 @@ tc_cls_act_func_proto(enum bpf_func_id func_id)
 	case BPF_FUNC_skb_under_cgroup:
 		return &bpf_skb_under_cgroup_proto;
 	default:
-		return sk_filter_func_proto(func_id);
+		return bpf_base_func_proto(func_id);
 	}
 }
 
@@ -2768,7 +2779,7 @@ xdp_func_proto(enum bpf_func_id func_id)
 	case BPF_FUNC_xdp_adjust_head:
 		return &bpf_xdp_adjust_head_proto;
 	default:
-		return sk_filter_func_proto(func_id);
+		return bpf_base_func_proto(func_id);
 	}
 }
 
@@ -2779,7 +2790,7 @@ cg_skb_func_proto(enum bpf_func_id func_id)
 	case BPF_FUNC_skb_load_bytes:
 		return &bpf_skb_load_bytes_proto;
 	default:
-		return sk_filter_func_proto(func_id);
+		return bpf_base_func_proto(func_id);
 	}
 }
 
@@ -3199,7 +3210,7 @@ static const struct bpf_verifier_ops cg_skb_ops = {
 };
 
 static const struct bpf_verifier_ops cg_sock_ops = {
-	.get_func_proto		= sk_filter_func_proto,
+	.get_func_proto		= bpf_base_func_proto,
 	.is_valid_access	= sock_filter_is_valid_access,
 	.convert_ctx_access	= sock_filter_convert_ctx_access,
 };
