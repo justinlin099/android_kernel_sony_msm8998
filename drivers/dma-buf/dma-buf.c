@@ -34,6 +34,13 @@
 #include <linux/poll.h>
 #include <linux/reservation.h>
 
+#ifdef CONFIG_DMABUF_HEAPS
+#include <linux/compat.h>
+#include <linux/sched.h>
+#include <linux/uaccess.h>
+#include <uapi/linux/dma-buf.h>
+#endif
+
 static inline int is_dma_buf_file(struct file *);
 
 struct dma_buf_list {
@@ -251,11 +258,70 @@ out:
 	return events;
 }
 
+#ifdef CONFIG_DMABUF_HEAPS
+static long dma_buf_ioctl(struct file *file, unsigned int cmd,
+			  unsigned long arg)
+{
+	struct dma_buf *dmabuf = file->private_data;
+	struct dma_buf_sync sync;
+	enum dma_data_direction direction;
+	long ret;
+
+	if (cmd != DMA_BUF_IOCTL_SYNC)
+		return -ENOTTY;
+	if (copy_from_user(&sync, (void __user *)arg, sizeof(sync)))
+		return -EFAULT;
+	if (sync.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
+		return -EINVAL;
+
+	switch (sync.flags & DMA_BUF_SYNC_RW) {
+	case DMA_BUF_SYNC_READ:
+		direction = DMA_FROM_DEVICE;
+		break;
+	case DMA_BUF_SYNC_WRITE:
+		direction = DMA_TO_DEVICE;
+		break;
+	case DMA_BUF_SYNC_RW:
+		direction = DMA_BIDIRECTIONAL;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (sync.flags & DMA_BUF_SYNC_END) {
+		dma_buf_end_cpu_access(dmabuf, 0, dmabuf->size, direction);
+		return 0;
+	}
+
+	/* Wait before invalidating CPU mappings of DMA-written buffers. */
+	ret = reservation_object_wait_timeout_rcu(dmabuf->resv,
+					direction != DMA_FROM_DEVICE, true,
+					MAX_SCHEDULE_TIMEOUT);
+	if (ret < 0)
+		return ret;
+	return dma_buf_begin_cpu_access(dmabuf, 0, dmabuf->size, direction);
+}
+
+#ifdef CONFIG_COMPAT
+static long dma_buf_compat_ioctl(struct file *file, unsigned int cmd,
+				 unsigned long arg)
+{
+	return dma_buf_ioctl(file, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+#endif
+
 static const struct file_operations dma_buf_fops = {
 	.release	= dma_buf_release,
 	.mmap		= dma_buf_mmap_internal,
 	.llseek		= dma_buf_llseek,
 	.poll		= dma_buf_poll,
+#ifdef CONFIG_DMABUF_HEAPS
+	.unlocked_ioctl	= dma_buf_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= dma_buf_compat_ioctl,
+#endif
+#endif
 };
 
 /*

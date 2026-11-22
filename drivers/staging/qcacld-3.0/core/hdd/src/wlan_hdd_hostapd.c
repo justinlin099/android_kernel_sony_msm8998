@@ -7304,6 +7304,7 @@ int wlan_hdd_cfg80211_update_apies(hdd_adapter_t *adapter)
 	tsap_Config_t *pConfig;
 	tSirUpdateIE updateIE;
 	beacon_data_t *beacon = NULL;
+	const uint8_t *rsnxe;
 	uint16_t proberesp_ies_len;
 	uint8_t *proberesp_ies = NULL;
 
@@ -7318,6 +7319,9 @@ int wlan_hdd_cfg80211_update_apies(hdd_adapter_t *adapter)
 
 	if (genie == NULL)
 		return -ENOMEM;
+
+	/* The firmware rebuilds the beacon and does not add RSNXE. */
+	wlan_hdd_add_extra_ie(adapter, genie, &total_ielen, SIR_MAC_RSNX_EID);
 
 	wlan_hdd_add_extra_ie(adapter, genie, &total_ielen,
 			      WLAN_EID_VHT_TX_POWER_ENVELOPE);
@@ -7344,27 +7348,6 @@ int wlan_hdd_cfg80211_update_apies(hdd_adapter_t *adapter)
 	qdf_copy_macaddr(&updateIE.bssid, &adapter->macAddressCurrent);
 	updateIE.smeSessionId = adapter->sessionId;
 
-	if (test_bit(SOFTAP_BSS_STARTED, &adapter->event_flags)) {
-		updateIE.ieBufferlength = total_ielen;
-		updateIE.pAdditionIEBuffer = genie;
-		updateIE.append = false;
-		updateIE.notify = true;
-		if (sme_update_add_ie(WLAN_HDD_GET_HAL_CTX(adapter),
-				      &updateIE,
-				      eUPDATE_IE_PROBE_BCN) ==
-		    QDF_STATUS_E_FAILURE) {
-			hdd_err("Could not pass on Add Ie probe beacon data");
-			ret = -EINVAL;
-			goto done;
-		}
-		wlansap_reset_sap_config_add_ie(pConfig, eUPDATE_IE_PROBE_BCN);
-	} else {
-		wlansap_update_sap_config_add_ie(pConfig,
-						 genie,
-						 total_ielen,
-						 eUPDATE_IE_PROBE_BCN);
-	}
-
 	/* Added for Probe Response IE */
 	proberesp_ies = qdf_mem_malloc(beacon->proberesp_ies_len +
 				      MAX_GENIE_LEN);
@@ -7380,6 +7363,26 @@ int wlan_hdd_cfg80211_update_apies(hdd_adapter_t *adapter)
 
 	wlan_hdd_add_sap_obss_scan_ie(adapter, proberesp_ies,
 				     &proberesp_ies_len);
+
+	/* Keep the offloaded Probe Response consistent with the Beacon. */
+	rsnxe = wlan_hdd_cfg80211_get_ie_ptr(beacon->tail, beacon->tail_len,
+					     SIR_MAC_RSNX_EID);
+	if (rsnxe && !wlan_hdd_cfg80211_get_ie_ptr(proberesp_ies,
+						  proberesp_ies_len,
+						  SIR_MAC_RSNX_EID)) {
+		uint16_t rsnxe_len = rsnxe[1] + 2;
+
+		if (proberesp_ies_len + rsnxe_len >
+		    WNI_CFG_PROBE_RSP_ADDNIE_DATA1_LEN) {
+			hdd_err("Probe Response has no room for RSNXE");
+			ret = -EINVAL;
+			goto done;
+		}
+
+		qdf_mem_copy(proberesp_ies + proberesp_ies_len,
+			     rsnxe, rsnxe_len);
+		proberesp_ies_len += rsnxe_len;
+	}
 
 	if (test_bit(SOFTAP_BSS_STARTED, &adapter->event_flags)) {
 		updateIE.ieBufferlength = proberesp_ies_len;
@@ -7400,6 +7403,28 @@ int wlan_hdd_cfg80211_update_apies(hdd_adapter_t *adapter)
 						 proberesp_ies,
 						 proberesp_ies_len,
 						 eUPDATE_IE_PROBE_RESP);
+	}
+
+	/* Update the Probe Response before notifying the beacon offload. */
+	if (test_bit(SOFTAP_BSS_STARTED, &adapter->event_flags)) {
+		updateIE.ieBufferlength = total_ielen;
+		updateIE.pAdditionIEBuffer = genie;
+		updateIE.append = false;
+		updateIE.notify = true;
+		if (sme_update_add_ie(WLAN_HDD_GET_HAL_CTX(adapter),
+				      &updateIE,
+				      eUPDATE_IE_PROBE_BCN) ==
+		    QDF_STATUS_E_FAILURE) {
+			hdd_err("Could not pass on Add Ie probe beacon data");
+			ret = -EINVAL;
+			goto done;
+		}
+		wlansap_reset_sap_config_add_ie(pConfig, eUPDATE_IE_PROBE_BCN);
+	} else {
+		wlansap_update_sap_config_add_ie(pConfig,
+						 genie,
+						 total_ielen,
+						 eUPDATE_IE_PROBE_BCN);
 	}
 
 	/* Assoc resp Add ie Data */

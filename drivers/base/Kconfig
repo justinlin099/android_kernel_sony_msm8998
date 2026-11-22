@@ -245,6 +245,18 @@ config DMA_SHARED_BUFFER
 	  APIs extension; the file's descriptor can then be passed on to other
 	  driver.
 
+config DMABUF_HEAPS
+	bool "DMA-BUF user-space allocation heaps"
+	depends on DMA_SHARED_BUFFER
+	help
+	  Provide named DMA-BUF allocation devices under /dev/dma_heap.
+
+config DMABUF_HEAPS_SYSTEM
+	bool "DMA-BUF system heap"
+	depends on DMABUF_HEAPS
+	help
+	  Provide a system heap backed by pages from the buddy allocator.
+
 config FENCE_TRACE
 	bool "Enable verbose FENCE_TRACE messages"
 	depends on DMA_SHARED_BUFFER

@@ -1411,6 +1411,11 @@ static int ion_dma_buf_begin_cpu_access(struct dma_buf *dmabuf, size_t start,
 					size_t len,
 					enum dma_data_direction direction)
 {
+#if defined(CONFIG_ION_IMPORT_DEVICE) && defined(CONFIG_ION_MSM)
+	if (direction != DMA_TO_DEVICE)
+		return ion_dma_buf_cache_op(dmabuf->priv, start, len,
+					    ION_IOC_INV_CACHES);
+#endif
 	return 0;
 }
 
@@ -1418,6 +1423,11 @@ static void ion_dma_buf_end_cpu_access(struct dma_buf *dmabuf, size_t start,
 				       size_t len,
 				       enum dma_data_direction direction)
 {
+#if defined(CONFIG_ION_IMPORT_DEVICE) && defined(CONFIG_ION_MSM)
+	if (direction != DMA_FROM_DEVICE)
+		ion_dma_buf_cache_op(dmabuf->priv, start, len,
+				     ION_IOC_CLEAN_CACHES);
+#endif
 }
 
 static struct dma_buf_ops dma_buf_ops = {

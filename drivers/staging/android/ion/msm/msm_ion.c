@@ -295,59 +295,70 @@ out:
 	return;
 }
 
-static int ion_pages_cache_ops(struct ion_client *client,
-			struct ion_handle *handle,
-			void *vaddr, unsigned int offset, unsigned int length,
-			unsigned int cmd)
+static int ion_pages_cache_ops(struct ion_buffer *buffer, size_t offset,
+			       size_t length, unsigned int cmd)
 {
-	struct sg_table *table = NULL;
+	struct sg_table *table = buffer->sg_table;
 	struct scatterlist *sg;
-	int i;
-	unsigned int len = 0;
 	void (*op)(const void *, const void *);
-	struct ion_buffer *buffer;
+	int i;
 
-	buffer = get_buffer(handle);
-	table = buffer->sg_table;
-	if (IS_ERR_OR_NULL(table))
+	if (IS_ERR(table))
 		return PTR_ERR(table);
+	if (!table || offset > buffer->size || length > buffer->size - offset)
+		return -EINVAL;
+	if (!length)
+		return 0;
 
 	switch (cmd) {
-		case ION_IOC_CLEAN_CACHES:
-			op = dmac_clean_range;
-			break;
-		case ION_IOC_INV_CACHES:
-			op = dmac_inv_range;
-			break;
-		case ION_IOC_CLEAN_INV_CACHES:
-			op = dmac_flush_range;
-			break;
-		default:
-			return -EINVAL;
-	};
+	case ION_IOC_CLEAN_CACHES:
+		op = dmac_clean_range;
+		break;
+	case ION_IOC_INV_CACHES:
+		op = dmac_inv_range;
+		break;
+	case ION_IOC_CLEAN_INV_CACHES:
+		op = dmac_flush_range;
+		break;
+	default:
+		return -EINVAL;
+	}
 
 	for_each_sg(table->sgl, sg, table->nents, i) {
-		unsigned int sg_offset, sg_left, size = 0;
+		size_t count;
 
-		len += sg->length;
-		if (len <= offset)
+		if (offset >= sg->length) {
+			offset -= sg->length;
 			continue;
+		}
+		if (!sg_page(sg) || offset > UINT_MAX - sg->offset)
+			return -EINVAL;
 
-		sg_left = len - offset;
-		sg_offset = sg->length - sg_left;
-
-		size = (length < sg_left) ? length : sg_left;
-
-		__do_cache_ops(sg_page(sg), sg_offset, size, op);
-
-		offset += size;
-		length -= size;
-
-		if (length == 0)
-			break;
+		count = min(length, sg->length - offset);
+		__do_cache_ops(sg_page(sg), sg->offset + offset, count, op);
+		length -= count;
+		if (!length)
+			return 0;
+		offset = 0;
 	}
-	return 0;
+
+	return -EINVAL;
 }
+
+#ifdef CONFIG_ION_IMPORT_DEVICE
+int ion_dma_buf_cache_op(struct ion_buffer *buffer, size_t offset,
+			 size_t length, unsigned int cmd)
+{
+	unsigned long flags = READ_ONCE(buffer->flags);
+
+	if ((flags & ION_FLAG_SECURE) || get_secure_vmid(flags) > 0)
+		return -EPERM;
+	if (!ION_IS_CACHED(flags))
+		return 0;
+
+	return ion_pages_cache_ops(buffer, offset, length, cmd);
+}
+#endif
 
 int ion_do_cache_op(struct ion_client *client, struct ion_handle *handle,
 			void *uaddr, unsigned long offset, unsigned long len,
@@ -384,8 +395,7 @@ int ion_do_cache_op(struct ion_client *client, struct ion_handle *handle,
 	page = sg_page(table->sgl);
 
 	if (page)
-		ret = ion_pages_cache_ops(client, handle, uaddr,
-					offset, len, cmd);
+		ret = ion_pages_cache_ops(buffer, offset, len, cmd);
 	else
 		ret = ion_no_pages_cache_ops(client, handle, uaddr,
 					offset, len, cmd);

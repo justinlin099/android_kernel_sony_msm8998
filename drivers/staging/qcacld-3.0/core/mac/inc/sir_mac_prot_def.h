@@ -352,6 +352,7 @@
 #define SIR_MAC_RSN_EID                48
 #define SIR_MAC_RSN_EID_MIN                4
 #define SIR_MAC_RSN_EID_MAX                254
+#define SIR_MAC_RSNX_EID              244
 
 /* using reserved EID for Qos Action IE for now, */
 /* need to check 11e spec for the actual EID */

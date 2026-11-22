@@ -27,6 +27,17 @@ HOSTCFLAGS_sortextable.o = -I$(srctree)/tools/include
 HOSTCFLAGS_asn1_compiler.o = -I$(srctree)/include
 HOSTCFLAGS_sign-file.o = $(CRYPTO_CFLAGS)
 HOSTLOADLIBES_sign-file = $(CRYPTO_LIBS)
+
+# The Android host sysroot can provide BoringSSL without CMS support.
+# A device can opt into the native compiler and OpenSSL for sign-file only.
+ifneq ($(KBUILD_SIGN_FILE_HOSTCC),)
+$(obj)/sign-file: private override HOSTCC = $(KBUILD_SIGN_FILE_HOSTCC)
+# The Android build PATH excludes the native assembler and linker.
+$(obj)/sign-file: private override HOSTCFLAGS = -B$(dir $(KBUILD_SIGN_FILE_HOSTCC)) -O2 -Wno-deprecated-declarations
+$(obj)/sign-file: private override HOSTLDFLAGS =
+$(obj)/sign-file: private CRYPTO_CFLAGS =
+$(obj)/sign-file: private CRYPTO_LIBS = -lcrypto
+endif
 HOSTCFLAGS_extract-cert.o = $(CRYPTO_CFLAGS)
 HOSTLOADLIBES_extract-cert = $(CRYPTO_LIBS)
 

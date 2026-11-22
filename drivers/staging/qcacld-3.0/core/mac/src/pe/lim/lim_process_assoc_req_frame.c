@@ -26,6 +26,7 @@
 #include "sir_api.h"
 #include "cfg_api.h"
 
+#include "cfg_api.h"
 #include "sch_api.h"
 #include "utils_api.h"
 #include "lim_types.h"
@@ -2382,6 +2383,42 @@ static void fill_mlm_assoc_ind_vht(tpSirAssocReq assocreq,
 	}
 }
 
+static bool lim_append_assoc_rsnxe(const tSirAssocReq *assoc_req,
+				   tLimMlmAssocInd *assoc_ind)
+{
+	unsigned int ie_offset = assoc_req->reassocRequest ?
+		SIR_MAC_REASSOC_SSID_OFFSET : LIM_ASSOC_REQ_IE_OFFSET;
+	unsigned int ies_len;
+	const u8 *rsnxe;
+	unsigned int rsnxe_len;
+
+	if (!assoc_req->assocReqFrame ||
+	    assoc_req->assocReqFrameLength <= ie_offset)
+		return true;
+
+	rsnxe = wlan_cfg_get_ie_ptr(assoc_req->assocReqFrame + ie_offset,
+				   assoc_req->assocReqFrameLength - ie_offset,
+				   SIR_MAC_RSNX_EID, ONE_BYTE);
+	if (!rsnxe)
+		return true;
+
+	rsnxe_len = 2 + rsnxe[1];
+	ies_len = assoc_ind->rsnIE.length + assoc_ind->addIE.length;
+#ifdef FEATURE_WLAN_WAPI
+	ies_len += assoc_ind->wapiIE.length;
+#endif
+	/* The SAP event limits the combined association IEs to 255 bytes. */
+	if (ies_len + rsnxe_len > SIR_MAC_MAX_IE_LENGTH) {
+		pe_warn("No room for RSNXE in association indication");
+		return false;
+	}
+
+	qdf_mem_copy(assoc_ind->addIE.addIEdata + assoc_ind->addIE.length,
+		     rsnxe, rsnxe_len);
+	assoc_ind->addIE.length += rsnxe_len;
+	return true;
+}
+
 QDF_STATUS lim_send_mlm_assoc_ind(tpAniSirGlobal mac_ctx,
 				  tpDphHashNode sta_ds,
 				  tpPESession session_entry)
@@ -2550,6 +2587,12 @@ QDF_STATUS lim_send_mlm_assoc_ind(tpAniSirGlobal mac_ctx,
 			 * because IOT will fail
 			 */
 		}
+		/* Forward the original RSNXE for hostapd's handshake check. */
+		if (!lim_append_assoc_rsnxe(assoc_req, assoc_ind)) {
+			qdf_mem_free(assoc_ind);
+			return QDF_STATUS_E_INVAL;
+		}
+
 		/* Required for indicating the frames to upper layer */
 		assoc_ind->assocReqLength = assoc_req->assocReqFrameLength;
 		assoc_ind->assocReqPtr = assoc_req->assocReqFrame;

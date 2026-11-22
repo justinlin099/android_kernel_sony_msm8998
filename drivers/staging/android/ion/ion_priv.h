@@ -542,4 +542,9 @@ int ion_phys_nolock(struct ion_client *client, struct ion_handle *handle,
  */
 struct ion_handle *ion_import_dma_buf_nolock(struct ion_client *client, int fd);
 
+#if defined(CONFIG_ION_IMPORT_DEVICE) && defined(CONFIG_ION_MSM)
+int ion_dma_buf_cache_op(struct ion_buffer *buffer, size_t offset,
+			 size_t length, unsigned int cmd);
+#endif
+
 #endif /* _ION_PRIV_H */
