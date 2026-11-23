@@ -622,6 +622,10 @@ static int check_stack_read(struct bpf_verifier_state *state, int off, int size,
 	slot_type = &state->stack_slot_type[MAX_BPF_STACK + off];
 
 	if (slot_type[0] == STACK_SPILL) {
+		const struct bpf_reg_state *spilled;
+		int slot = (MAX_BPF_STACK + off) / BPF_REG_SIZE;
+
+		spilled = &state->spilled_regs[slot];
 		if (size != BPF_REG_SIZE) {
 			verbose("invalid size of register spill\n");
 			return -EACCES;
@@ -633,10 +637,12 @@ static int check_stack_read(struct bpf_verifier_state *state, int off, int size,
 			}
 		}
 
-		if (value_regno >= 0)
-			/* restore register state from stack */
-			state->regs[value_regno] =
-				state->spilled_regs[(MAX_BPF_STACK + off) / BPF_REG_SIZE];
+		if (value_regno >= 0) {
+			state->regs[value_regno] = *spilled;
+		} else if (is_ringbuf_ptr(spilled->type)) {
+			verbose("invalid indirect access to a spilled ring buffer pointer\n");
+			return -EACCES;
+		}
 		return 0;
 	} else {
 		for (i = 0; i < size; i++) {
@@ -839,7 +845,7 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 
 	if (t == BPF_WRITE && value_regno >= 0 &&
 	    is_ringbuf_ptr(state->regs[value_regno].type) &&
-	    reg->type != PTR_TO_STACK) {
+	    reg->type != PTR_TO_STACK && reg->type != FRAME_PTR) {
 		verbose("R%d leaks a ring buffer reservation\n", value_regno);
 		return -EACCES;
 	}
