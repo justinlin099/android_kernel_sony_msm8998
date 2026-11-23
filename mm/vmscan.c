@@ -3614,7 +3614,8 @@ static int kswapd(void *p)
 		 * after returning from the refrigerator
 		 */
 		if (!ret) {
-			trace_mm_vmscan_kswapd_wake(pgdat->node_id, order);
+			trace_mm_vmscan_kswapd_wake(pgdat->node_id,
+						  classzone_idx, order);
 			balanced_classzone_idx = balance_pgdat(pgdat, order,
 								classzone_idx);
 		}
