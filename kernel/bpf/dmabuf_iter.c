@@ -159,8 +159,13 @@ static const struct bpf_func_proto bpf_iter_seq_printf_proto = {
 static const struct bpf_func_proto *dmabuf_iter_func_proto(enum bpf_func_id id)
 {
 	switch (id) {
+	/* libbpf substitutes the legacy IDs when its tracepoint probe fails.
+	 * Both spellings use the iterator's checked, kernel-only accessors.
+	 */
+	case BPF_FUNC_probe_read:
 	case BPF_FUNC_probe_read_kernel:
 		return &bpf_iter_read_kernel_proto;
+	case BPF_FUNC_probe_read_str:
 	case BPF_FUNC_probe_read_kernel_str:
 		return &bpf_iter_read_kernel_str_proto;
 	case BPF_FUNC_seq_printf:
