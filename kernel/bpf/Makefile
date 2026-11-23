@@ -7,3 +7,4 @@ ifeq ($(CONFIG_PERF_EVENTS),y)
 obj-$(CONFIG_BPF_SYSCALL) += stackmap.o
 endif
 obj-$(CONFIG_CGROUP_BPF) += cgroup.o
+obj-$(CONFIG_DEBUG_INFO_BTF) += btf_sysfs.o

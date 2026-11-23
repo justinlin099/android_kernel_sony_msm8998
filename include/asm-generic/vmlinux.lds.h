@@ -263,6 +263,17 @@
 /*
  * Read only Data
  */
+#ifdef CONFIG_DEBUG_INFO_BTF
+#define BTF_DATA()							\
+	.BTF : AT(ADDR(.BTF) - LOAD_OFFSET) {				\
+		VMLINUX_SYMBOL(__start_BTF) = .;				\
+		KEEP(*(.BTF))						\
+		VMLINUX_SYMBOL(__stop_BTF) = .;				\
+	}
+#else
+#define BTF_DATA()
+#endif
+
 #define RO_DATA_SECTION(align)						\
 	. = ALIGN((align));						\
 	.rodata           : AT(ADDR(.rodata) - LOAD_OFFSET) {		\
@@ -276,6 +287,7 @@
 		VMLINUX_SYMBOL(__stop___tracepoints_ptrs) = .;		\
 		*(__tracepoints_strings)/* Tracepoints: strings */	\
 	}								\
+	BTF_DATA()							\
 									\
 	.rodata1          : AT(ADDR(.rodata1) - LOAD_OFFSET) {		\
 		*(.rodata1)						\

@@ -141,6 +141,27 @@ vmlinux_link()
 }
 
 
+# Generate a read-only ELF section from the linked kernel's DWARF types.
+gen_btf()
+{
+	if ! command -v "${PAHOLE}" >/dev/null; then
+		echo >&2 "BTF requires pahole with --btf_encode_detached support"
+		return 1
+	fi
+
+	vmlinux_link "" .tmp_vmlinux_for_btf
+	info BTF .tmp_vmlinux.btf
+	"${PAHOLE}" --btf_encode_detached=.tmp_vmlinux.btf \
+		--skip_encoding_btf_enum64 --skip_encoding_btf_decl_tag \
+		--skip_encoding_btf_type_tag .tmp_vmlinux_for_btf
+	test -s .tmp_vmlinux.btf
+	printf '%s\n' '.section .BTF,"a"' '.balign 4' \
+		'.incbin ".tmp_vmlinux.btf"' |
+		CCACHE_DISABLE=1 ${CC} ${KBUILD_AFLAGS} ${KBUILD_AFLAGS_KERNEL} \
+			-c -x assembler -o .tmp_vmlinux_btf.o -
+	rm -f .tmp_vmlinux_for_btf .tmp_vmlinux.btf
+}
+
 # Create ${2} .o file with all symbols from the ${1} object file
 kallsyms()
 {
@@ -257,6 +278,13 @@ modpost_link vmlinux.o
 # modpost vmlinux.o to check for section mismatches
 ${MAKE} -f "${srctree}/scripts/Makefile.modpost" vmlinux.o
 
+
+btf_vmlinux=""
+if [ -n "${CONFIG_DEBUG_INFO_BTF}" ]; then
+	gen_btf
+	btf_vmlinux=.tmp_vmlinux_btf.o
+fi
+
 kallsymso=""
 kallsyms_vmlinux=""
 if [ -n "${CONFIG_KALLSYMS}" ]; then
@@ -284,11 +312,11 @@ if [ -n "${CONFIG_KALLSYMS}" ]; then
 	kallsyms_vmlinux=.tmp_vmlinux2
 
 	# step 1
-	vmlinux_link "" .tmp_vmlinux1
+	vmlinux_link "${btf_vmlinux}" .tmp_vmlinux1
 	kallsyms .tmp_vmlinux1 .tmp_kallsyms1.o
 
 	# step 2
-	vmlinux_link .tmp_kallsyms1.o .tmp_vmlinux2
+	vmlinux_link ".tmp_kallsyms1.o ${btf_vmlinux}" .tmp_vmlinux2
 	kallsyms .tmp_vmlinux2 .tmp_kallsyms2.o
 
 	# step 2a
@@ -296,14 +324,14 @@ if [ -n "${CONFIG_KALLSYMS}" ]; then
 		kallsymso=.tmp_kallsyms3.o
 		kallsyms_vmlinux=.tmp_vmlinux3
 
-		vmlinux_link .tmp_kallsyms2.o .tmp_vmlinux3
+		vmlinux_link ".tmp_kallsyms2.o ${btf_vmlinux}" .tmp_vmlinux3
 
 		kallsyms .tmp_vmlinux3 .tmp_kallsyms3.o
 	fi
 fi
 
 info LD vmlinux
-vmlinux_link "${kallsymso}" vmlinux
+vmlinux_link "${kallsymso} ${btf_vmlinux}" vmlinux
 
 if [ -n "${CONFIG_BUILDTIME_EXTABLE_SORT}" ]; then
 	info SORTEX vmlinux
