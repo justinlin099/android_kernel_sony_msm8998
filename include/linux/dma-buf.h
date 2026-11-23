@@ -145,6 +145,9 @@ struct dma_buf {
 
 		unsigned long active;
 	} cb_excl, cb_shared;
+
+	/* Replaced under lock. Readers hold RCU until done using the name. */
+	const char __rcu *name;
 };
 
 /**

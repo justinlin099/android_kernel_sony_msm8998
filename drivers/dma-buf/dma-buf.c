@@ -33,13 +33,14 @@
 #include <linux/seq_file.h>
 #include <linux/poll.h>
 #include <linux/reservation.h>
+#include <linux/rcupdate.h>
 #include <uapi/linux/magic.h>
+#include <uapi/linux/dma-buf.h>
 
 #ifdef CONFIG_DMABUF_HEAPS
 #include <linux/compat.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
-#include <uapi/linux/dma-buf.h>
 #endif
 
 static inline int is_dma_buf_file(struct file *);
@@ -48,6 +49,22 @@ struct dma_buf_list {
 	struct list_head head;
 	struct mutex lock;
 };
+
+struct dma_buf_name {
+	struct rcu_head rcu;
+	char text[DMA_BUF_NAME_LEN];
+};
+
+static void dma_buf_name_put(const char *name)
+{
+	struct dma_buf_name *entry;
+
+	if (!name)
+		return;
+
+	entry = container_of(name, struct dma_buf_name, text[0]);
+	kfree_rcu(entry, rcu);
+}
 
 static struct dma_buf_list db_list;
 static struct vfsmount *dma_buf_mnt;
@@ -99,6 +116,7 @@ static int dma_buf_release(struct inode *inode, struct file *file)
 	if (dmabuf->resv == (struct reservation_object *)&dmabuf[1])
 		reservation_object_fini(dmabuf->resv);
 
+	dma_buf_name_put(rcu_dereference_protected(dmabuf->name, 1));
 	module_put(dmabuf->owner);
 	kfree(dmabuf);
 	return 0;
@@ -278,6 +296,39 @@ out:
 }
 
 #ifdef CONFIG_DMABUF_HEAPS
+static long dma_buf_set_name(struct dma_buf *dmabuf, const char __user *user_name)
+{
+	char name[DMA_BUF_NAME_LEN];
+	struct dma_buf_name *entry;
+	const char *old_name;
+	long length;
+
+	length = strncpy_from_user(name, user_name, sizeof(name));
+	if (length < 0)
+		return length;
+	if (length == sizeof(name))
+		return -EINVAL;
+
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+	memcpy(entry->text, name, length + 1);
+
+	mutex_lock(&dmabuf->lock);
+	old_name = rcu_dereference_protected(dmabuf->name,
+					    lockdep_is_held(&dmabuf->lock));
+	if (old_name && !strcmp(old_name, entry->text)) {
+		mutex_unlock(&dmabuf->lock);
+		kfree(entry);
+		return 0;
+	}
+
+	rcu_assign_pointer(dmabuf->name, entry->text);
+	mutex_unlock(&dmabuf->lock);
+	dma_buf_name_put(old_name);
+	return 0;
+}
+
 static long dma_buf_ioctl(struct file *file, unsigned int cmd,
 			  unsigned long arg)
 {
@@ -286,6 +337,8 @@ static long dma_buf_ioctl(struct file *file, unsigned int cmd,
 	enum dma_data_direction direction;
 	long ret;
 
+	if (cmd == DMA_BUF_SET_NAME_A || cmd == DMA_BUF_SET_NAME_B)
+		return dma_buf_set_name(dmabuf, (const char __user *)arg);
 	if (cmd != DMA_BUF_IOCTL_SYNC)
 		return -ENOTTY;
 	if (copy_from_user(&sync, (void __user *)arg, sizeof(sync)))
@@ -333,12 +386,22 @@ static long dma_buf_compat_ioctl(struct file *file, unsigned int cmd,
 static void dma_buf_show_fdinfo(struct seq_file *m, struct file *file)
 {
 	struct dma_buf *dmabuf = file->private_data;
+	const char *name;
 
 	seq_printf(m, "size:\t%zu\n", dmabuf->size);
 	/* The fdinfo reader itself holds a temporary reference. */
 	seq_printf(m, "count:\t%ld\n", file_count(file) - 1);
 	seq_printf(m, "exp_name:\t%s\n", dmabuf->exp_name);
 	seq_printf(m, "ino:\t%lu\n", file_inode(file)->i_ino);
+
+	rcu_read_lock();
+	name = rcu_dereference(dmabuf->name);
+	if (name) {
+		seq_puts(m, "name:\t");
+		seq_escape(m, name, "\r\n");
+		seq_putc(m, '\n');
+	}
+	rcu_read_unlock();
 }
 
 static const struct file_operations dma_buf_fops = {
