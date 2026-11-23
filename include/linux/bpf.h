@@ -47,7 +47,7 @@ struct bpf_map {
 	u32 map_flags;
 	u32 pages;
 	bool unpriv_array;
-	/* 7 bytes hole */
+	u32 id;
 
 	/* 2nd cacheline with misc members to avoid false sharing
 	 * particularly with refcounting.
