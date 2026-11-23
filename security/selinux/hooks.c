@@ -6100,7 +6100,7 @@ static int bpf_fd_pass(struct file *file, u32 sid)
 	struct bpf_map *map;
 	int ret;
 
-	if (file->f_op == &bpf_map_fops) {
+	if (bpf_is_map_file(file)) {
 		map = file->private_data;
 		bpfsec = map->security;
 		ret = avc_has_perm(sid, bpfsec->sid, SECCLASS_BPF,

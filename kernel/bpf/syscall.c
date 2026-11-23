@@ -227,7 +227,7 @@ static ssize_t bpf_dummy_write(struct file *filp, const char __user *buf,
 	return -EINVAL;
 }
 
-const struct file_operations bpf_map_fops = {
+static const struct file_operations bpf_map_fops = {
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo	= bpf_map_show_fdinfo,
 #endif
@@ -236,16 +236,48 @@ const struct file_operations bpf_map_fops = {
 	.write		= bpf_dummy_write,
 };
 
+static int bpf_map_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct bpf_map *map = filp->private_data;
+
+	return map->ops->map_mmap(map, vma);
+}
+
+static unsigned int bpf_map_poll(struct file *filp, struct poll_table_struct *wait)
+{
+	struct bpf_map *map = filp->private_data;
+
+	return map->ops->map_poll(map, filp, wait);
+}
+
+static const struct file_operations bpf_ringbuf_fops = {
+#ifdef CONFIG_PROC_FS
+	.show_fdinfo	= bpf_map_show_fdinfo,
+#endif
+	.release	= bpf_map_release,
+	.mmap		= bpf_map_mmap,
+	.poll		= bpf_map_poll,
+	.read		= bpf_dummy_read,
+	.write		= bpf_dummy_write,
+};
+
+bool bpf_is_map_file(const struct file *file)
+{
+	return file->f_op == &bpf_map_fops || file->f_op == &bpf_ringbuf_fops;
+}
+
 int bpf_map_new_fd(struct bpf_map *map, int flags)
 {
+	const struct file_operations *fops = &bpf_map_fops;
 	int ret;
 
 	ret = security_bpf_map(map, OPEN_FMODE(flags));
 	if (ret < 0)
 		return ret;
 
-	return anon_inode_getfd("bpf-map", &bpf_map_fops, map,
-				flags | O_CLOEXEC);
+	if (map->map_type == BPF_MAP_TYPE_RINGBUF)
+		fops = &bpf_ringbuf_fops;
+	return anon_inode_getfd("bpf-map", fops, map, flags | O_CLOEXEC);
 }
 
 int bpf_get_file_flag(int flags)
@@ -327,7 +359,7 @@ struct bpf_map *__bpf_map_get(struct fd f)
 {
 	if (!f.file)
 		return ERR_PTR(-EBADF);
-	if (f.file->f_op != &bpf_map_fops) {
+	if (!bpf_is_map_file(f.file)) {
 		fdput(f);
 		return ERR_PTR(-EINVAL);
 	}
@@ -399,6 +431,11 @@ static int map_lookup_elem(union bpf_attr *attr)
 
 	if (!(f.file->f_mode & FMODE_CAN_READ)) {
 		err = -EPERM;
+		goto err_put;
+	}
+
+	if (map->map_type == BPF_MAP_TYPE_RINGBUF) {
+		err = -ENOTSUPP;
 		goto err_put;
 	}
 

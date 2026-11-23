@@ -16,6 +16,9 @@
 struct perf_event;
 struct bpf_map;
 
+struct vm_area_struct;
+struct poll_table_struct;
+
 /* map is generic key/value storage optionally accesible by eBPF programs */
 struct bpf_map_ops {
 	/* funcs callable from userspace (via syscall) */
@@ -33,6 +36,10 @@ struct bpf_map_ops {
 	void *(*map_fd_get_ptr)(struct bpf_map *map, struct file *map_file,
 				int fd);
 	void (*map_fd_put_ptr)(void *ptr);
+
+	int (*map_mmap)(struct bpf_map *map, struct vm_area_struct *vma);
+	unsigned int (*map_poll)(struct bpf_map *map, struct file *filp,
+				 struct poll_table_struct *wait);
 };
 
 struct bpf_map {
@@ -299,7 +306,7 @@ DECLARE_PER_CPU(int, bpf_prog_active);
 void bpf_register_prog_type(struct bpf_prog_type_list *tl);
 void bpf_register_map_type(struct bpf_map_type_list *tl);
 
-extern const struct file_operations bpf_map_fops;
+bool bpf_is_map_file(const struct file *file);
 extern const struct file_operations bpf_prog_fops;
 
 struct bpf_prog *bpf_prog_get(u32 ufd);
