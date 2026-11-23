@@ -155,7 +155,7 @@ static int __init btf_read_initramfs(void *encoded, u32 size)
 	loff_t position = 0;
 	int err = 0;
 
-	file = filp_open("/.lilac-vmlinux.btf.xz", O_RDONLY | O_NOFOLLOW, 0);
+	file = filp_open("/lilac-vmlinux.btf.xz", O_RDONLY | O_NOFOLLOW, 0);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
 	if (!S_ISREG(file_inode(file)->i_mode) ||
