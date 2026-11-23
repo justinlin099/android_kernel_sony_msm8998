@@ -17,7 +17,12 @@
 
 /* ld/ldx fields */
 #define BPF_DW		0x18	/* double word */
-#define BPF_XADD	0xc0	/* exclusive add */
+#define BPF_ATOMIC	0xc0	/* atomic memory operation */
+#define BPF_XADD	BPF_ATOMIC	/* legacy atomic add */
+
+#define BPF_FETCH	0x01	/* return the old value */
+#define BPF_XCHG	(0xe0 | BPF_FETCH)
+#define BPF_CMPXCHG	(0xf0 | BPF_FETCH)
 
 /* alu/jmp fields */
 #define BPF_MOV		0xb0	/* mov reg to reg */

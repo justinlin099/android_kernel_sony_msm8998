@@ -969,47 +969,89 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	return err;
 }
 
-static int check_xadd(struct bpf_verifier_env *env, int insn_idx, struct bpf_insn *insn)
+static bool valid_bpf_atomic_op(s32 imm)
+{
+	switch (imm) {
+	case BPF_ADD:
+	case BPF_ADD | BPF_FETCH:
+	case BPF_AND:
+	case BPF_AND | BPF_FETCH:
+	case BPF_OR:
+	case BPF_OR | BPF_FETCH:
+	case BPF_XOR:
+	case BPF_XOR | BPF_FETCH:
+	case BPF_XCHG:
+	case BPF_CMPXCHG:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool bpf_reg_is_scalar(const struct bpf_reg_state *reg)
+{
+	return reg->type == CONST_IMM || reg->type == UNKNOWN_VALUE;
+}
+
+static int check_atomic(struct bpf_verifier_env *env, int insn_idx,
+			struct bpf_insn *insn)
 {
 	struct bpf_reg_state *regs = env->cur_state.regs;
+	u32 src = insn->src_reg, dst = insn->dst_reg;
+	u32 result = insn->imm == BPF_CMPXCHG ? BPF_REG_0 : src;
 	int err;
 
 	if ((BPF_SIZE(insn->code) != BPF_W && BPF_SIZE(insn->code) != BPF_DW) ||
-	    insn->imm != 0) {
-		verbose("BPF_XADD uses reserved fields\n");
+	    !valid_bpf_atomic_op(insn->imm)) {
+		verbose("invalid BPF atomic operation\n");
 		return -EINVAL;
 	}
 
-	/* check src1 operand */
-	err = check_reg_arg(regs, insn->src_reg, SRC_OP);
+	/* Other JITs and the 4.4 interpreter only implement legacy ADD. */
+	if (insn->imm != BPF_ADD &&
+	    (!IS_ENABLED(CONFIG_ARM64) || !IS_ENABLED(CONFIG_BPF_JIT_ALWAYS_ON)))
+		return -EOPNOTSUPP;
+
+	err = check_reg_arg(regs, src, SRC_OP);
+	if (err)
+		return err;
+	err = check_reg_arg(regs, dst, SRC_OP);
 	if (err)
 		return err;
 
-	/* check src2 operand */
-	err = check_reg_arg(regs, insn->dst_reg, SRC_OP);
-	if (err)
-		return err;
-
-	if (is_pointer_value(env, insn->src_reg)) {
-		verbose("R%d leaks addr into mem\n", insn->src_reg);
+	if (is_pointer_value(env, src)) {
+		verbose("R%d leaks addr into mem\n", src);
+		return -EACCES;
+	}
+	if (is_ctx_reg(env, dst)) {
+		verbose("atomic store into R%d context is not allowed\n", dst);
 		return -EACCES;
 	}
 
-	if (is_ctx_reg(env, insn->dst_reg)) {
-		verbose("BPF_XADD stores into R%d context is not allowed\n",
-			insn->dst_reg);
-		return -EACCES;
+	if (insn->imm != BPF_ADD) {
+		/* Legacy spills do not describe scalar values read by atomics. */
+		if ((regs[dst].type != PTR_TO_MAP_VALUE &&
+		     regs[dst].type != PTR_TO_MAP_VALUE_ADJ) ||
+		    !bpf_reg_is_scalar(&regs[src]))
+			return -EACCES;
+		if (insn->imm == BPF_CMPXCHG && !bpf_reg_is_scalar(&regs[BPF_REG_0]))
+			return -EACCES;
 	}
 
-	/* check whether atomic_add can read the memory */
-	err = check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
+	err = check_mem_access(env, insn_idx, dst, insn->off,
 			       BPF_SIZE(insn->code), BPF_READ, -1);
 	if (err)
 		return err;
+	err = check_mem_access(env, insn_idx, dst, insn->off,
+			       BPF_SIZE(insn->code), BPF_WRITE, -1);
+	if (err)
+		return err;
 
-	/* check whether atomic_add can write into the same memory */
-	return check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
-				BPF_SIZE(insn->code), BPF_WRITE, -1);
+	if (insn->imm & BPF_FETCH) {
+		mark_reg_unknown_value(regs, result);
+		reset_reg_range_values(regs, result);
+	}
+	return 0;
 }
 
 /* when register 'regno' is passed into function that will read 'access_size'
@@ -3419,8 +3461,8 @@ static int do_check(struct bpf_verifier_env *env)
 		} else if (class == BPF_STX) {
 			enum bpf_reg_type *prev_dst_type, dst_reg_type;
 
-			if (BPF_MODE(insn->code) == BPF_XADD) {
-				err = check_xadd(env, insn_idx, insn);
+			if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+				err = check_atomic(env, insn_idx, insn);
 				if (err)
 					return err;
 				insn_idx++;
@@ -3615,8 +3657,8 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 		}
 
 		if (BPF_CLASS(insn->code) == BPF_STX &&
-		    ((BPF_MODE(insn->code) != BPF_MEM &&
-		      BPF_MODE(insn->code) != BPF_XADD) || insn->imm != 0)) {
+		    !(BPF_MODE(insn->code) == BPF_ATOMIC ||
+		      (BPF_MODE(insn->code) == BPF_MEM && !insn->imm))) {
 			verbose("BPF_STX uses reserved fields\n");
 			return -EINVAL;
 		}

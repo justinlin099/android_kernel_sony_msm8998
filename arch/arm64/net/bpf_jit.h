@@ -99,6 +99,9 @@
 /* [Rn] = Rt; (atomic) Rs = [state] */
 #define A64_STXR(sf, Rt, Rn, Rs) \
 	A64_LSX(sf, Rt, Rn, Rs, STORE_EX)
+/* Bit 15 selects release ordering for the store-exclusive encoding. */
+#define A64_STLXR(sf, Rt, Rn, Rs) (A64_STXR(sf, Rt, Rn, Rs) | BIT(15))
+#define A64_DMB_ISH 0xd5033bbf
 
 /* LSE atomics */
 #define A64_STADD(sf, Rn, Rs) \
