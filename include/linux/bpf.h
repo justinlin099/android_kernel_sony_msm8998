@@ -9,6 +9,7 @@
 
 #include <uapi/linux/bpf.h>
 #include <linux/workqueue.h>
+#include <linux/mutex.h>
 #include <linux/file.h>
 #include <linux/percpu.h>
 #include <linux/err.h>
@@ -63,6 +64,8 @@ struct bpf_map {
 	atomic_t refcnt;
 	atomic_t usercnt;
 	struct work_struct work;
+	struct mutex freeze_mutex;
+	bool frozen;
 #ifdef CONFIG_SECURITY
 	void *security;
 #endif
@@ -171,6 +174,7 @@ enum bpf_reg_type {
 	PTR_TO_MAP_VALUE_ADJ,
 	PTR_TO_RINGBUF,
 	PTR_TO_RINGBUF_OR_NULL,
+	PTR_TO_MAP_VALUE_DIRECT,
 };
 
 struct bpf_prog;

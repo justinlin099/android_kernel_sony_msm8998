@@ -90,6 +90,7 @@ enum bpf_cmd {
 	BPF_PROG_DETACH,
 	BPF_OBJ_GET_INFO_BY_FD = 15,
 	BPF_RAW_TRACEPOINT_OPEN = 17,
+	BPF_MAP_FREEZE = 22,
 };
 
 enum bpf_map_type {
@@ -178,6 +179,7 @@ enum bpf_attach_type {
 #define BPF_F_ALLOW_MULTI	(1U << 1)
 
 #define BPF_PSEUDO_MAP_FD	1
+#define BPF_PSEUDO_MAP_VALUE	2
 
 /* flags for BPF_MAP_UPDATE_ELEM command */
 #define BPF_ANY		0 /* create new element or update existing */
@@ -189,6 +191,7 @@ enum bpf_attach_type {
 /* Flags for accessing BPF object */
 #define BPF_F_RDONLY		(1U << 3)
 #define BPF_F_WRONLY		(1U << 4)
+#define BPF_F_RDONLY_PROG	(1U << 7)
 
 union bpf_attr {
 	struct { /* anonymous struct used by BPF_MAP_CREATE command */

@@ -39,6 +39,7 @@ struct bpf_reg_state {
 			s32 ring_off;
 		};
 	};
+	s32 direct_off;	/* fixed offset of PTR_TO_MAP_VALUE_DIRECT */
 	u32 id;
 	/* Used to determine if any memory access using this register will
 	 * result in a bad access. These two fields must be last.
@@ -80,6 +81,7 @@ struct bpf_insn_aux_data {
 		enum bpf_reg_type ptr_type;     /* pointer type for load/store insns */
 		struct bpf_map *map_ptr;        /* pointer for call insn into lookup_elem */
 	};
+	u32 map_value_off;	/* LD_IMM64 direct map value offset */
 	int sanitize_stack_off; /* stack slot to be cleared */
 	bool seen; /* this insn was processed by the verifier */
 };

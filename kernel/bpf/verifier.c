@@ -188,6 +188,7 @@ static const char * const reg_type_str[] = {
 	[PTR_TO_MAP_VALUE_ADJ]	= "map_value_adj",
 	[PTR_TO_RINGBUF]	= "ringbuf",
 	[PTR_TO_RINGBUF_OR_NULL] = "ringbuf_or_null",
+	[PTR_TO_MAP_VALUE_DIRECT] = "map_value_direct",
 	[FRAME_PTR]		= "fp",
 	[PTR_TO_STACK]		= "fp",
 	[CONST_IMM]		= "imm",
@@ -359,7 +360,8 @@ static void print_bpf_insn(const struct bpf_verifier_env *env,
 			 * part of the ldimm64 insn is accessible.
 			 */
 			u64 imm = ((u64)(insn + 1)->imm << 32) | (u32)insn->imm;
-			bool map_ptr = insn->src_reg == BPF_PSEUDO_MAP_FD;
+			bool map_ptr = insn->src_reg == BPF_PSEUDO_MAP_FD ||
+				       insn->src_reg == BPF_PSEUDO_MAP_VALUE;
 
 			if (map_ptr && !env->allow_ptr_leaks)
 				imm = 0;
@@ -469,6 +471,7 @@ static void __mark_reg_unknown_value(struct bpf_reg_state *regs, u32 regno)
 	regs[regno].type = UNKNOWN_VALUE;
 	regs[regno].id = 0;
 	regs[regno].imm = 0;
+	regs[regno].direct_off = 0;
 }
 
 static void mark_reg_unknown_value(struct bpf_reg_state *regs, u32 regno)
@@ -534,6 +537,11 @@ static bool is_ringbuf_ptr(enum bpf_reg_type type)
 	return type == PTR_TO_RINGBUF || type == PTR_TO_RINGBUF_OR_NULL;
 }
 
+static bool is_tracked_mem_ptr(enum bpf_reg_type type)
+{
+	return is_ringbuf_ptr(type) || type == PTR_TO_MAP_VALUE_DIRECT;
+}
+
 static bool is_spillable_regtype(enum bpf_reg_type type)
 {
 	switch (type) {
@@ -547,6 +555,7 @@ static bool is_spillable_regtype(enum bpf_reg_type type)
 	case CONST_PTR_TO_MAP:
 	case PTR_TO_RINGBUF:
 	case PTR_TO_RINGBUF_OR_NULL:
+	case PTR_TO_MAP_VALUE_DIRECT:
 		return true;
 	default:
 		return false;
@@ -639,8 +648,8 @@ static int check_stack_read(struct bpf_verifier_state *state, int off, int size,
 
 		if (value_regno >= 0) {
 			state->regs[value_regno] = *spilled;
-		} else if (is_ringbuf_ptr(spilled->type)) {
-			verbose("invalid indirect access to a spilled ring buffer pointer\n");
+		} else if (is_tracked_mem_ptr(spilled->type)) {
+			verbose("invalid indirect access to a spilled memory pointer\n");
 			return -EACCES;
 		}
 		return 0;
@@ -665,7 +674,7 @@ static int check_map_access(struct bpf_verifier_env *env, u32 regno, int off,
 {
 	struct bpf_map *map = env->cur_state.regs[regno].map_ptr;
 
-	if (off < 0 || off + size > map->value_size) {
+	if (off < 0 || size < 0 || (u64)off + size > map->value_size) {
 		verbose("invalid access to map value, value_size=%d off=%d size=%d\n",
 			map->value_size, off, size);
 		return -EACCES;
@@ -730,7 +739,7 @@ static int check_ctx_access(struct bpf_verifier_env *env, int off, int size,
 static bool __is_pointer_value(bool allow_ptr_leaks,
 			       const struct bpf_reg_state *reg)
 {
-	if (is_ringbuf_ptr(reg->type))
+	if (is_tracked_mem_ptr(reg->type))
 		return true;
 	if (allow_ptr_leaks)
 		return false;
@@ -832,6 +841,8 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 
 	if (reg->type == PTR_TO_STACK)
 		off += reg->imm;
+	else if (reg->type == PTR_TO_MAP_VALUE_DIRECT)
+		off += reg->direct_off;
 
 	size = bpf_size_to_bytes(bpf_size);
 	if (size < 0)
@@ -844,9 +855,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		return err;
 
 	if (t == BPF_WRITE && value_regno >= 0 &&
-	    is_ringbuf_ptr(state->regs[value_regno].type) &&
+	    is_tracked_mem_ptr(state->regs[value_regno].type) &&
 	    reg->type != PTR_TO_STACK && reg->type != FRAME_PTR) {
-		verbose("R%d leaks a ring buffer reservation\n", value_regno);
+		verbose("R%d leaks a bounded memory pointer\n", value_regno);
 		return -EACCES;
 	}
 
@@ -858,7 +869,12 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	}
 
 	if (reg->type == PTR_TO_MAP_VALUE ||
-	    reg->type == PTR_TO_MAP_VALUE_ADJ) {
+	    reg->type == PTR_TO_MAP_VALUE_ADJ ||
+	    reg->type == PTR_TO_MAP_VALUE_DIRECT) {
+		if (t == BPF_WRITE && (reg->map_ptr->map_flags & BPF_F_RDONLY_PROG)) {
+			verbose("R%d points to a read-only map value\n", regno);
+			return -EACCES;
+		}
 		if (t == BPF_WRITE && value_regno >= 0 &&
 		    is_pointer_value(env, value_regno)) {
 			verbose("R%d leaks addr into map\n", value_regno);
@@ -1156,7 +1172,8 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 	if (arg_type == ARG_PTR_TO_MAP_KEY ||
 	    arg_type == ARG_PTR_TO_MAP_VALUE) {
 		expected_type = PTR_TO_STACK;
-		if (type != PTR_TO_PACKET && type != expected_type)
+		if (type != PTR_TO_PACKET && type != expected_type &&
+		    !(arg_type == ARG_PTR_TO_MAP_VALUE && type == PTR_TO_MAP_VALUE_DIRECT))
 			goto err_type;
 	} else if (arg_type == ARG_CONST_STACK_SIZE ||
 		   arg_type == ARG_CONST_STACK_SIZE_OR_ZERO) {
@@ -1225,6 +1242,9 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 		if (type == PTR_TO_PACKET)
 			err = check_packet_access(env, regno, 0,
 						  meta->map_ptr->value_size);
+		else if (type == PTR_TO_MAP_VALUE_DIRECT)
+			err = check_map_access(env, regno, reg->direct_off,
+					       meta->map_ptr->value_size);
 		else
 			err = check_stack_boundary(env, regno,
 						   meta->map_ptr->value_size,
@@ -1262,6 +1282,10 @@ static int check_map_func_compatibility(struct bpf_map *map, int func_id)
 {
 	if (!map)
 		return 0;
+
+	if (map->map_flags & BPF_F_RDONLY_PROG &&
+	    (func_id == BPF_FUNC_map_update_elem || func_id == BPF_FUNC_map_delete_elem))
+		goto error;
 
 	/* We need a two way check, first is from map perspective ... */
 	switch (map->map_type) {
@@ -2085,7 +2109,7 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			if (err)
 				return err;
 
-			if (is_ringbuf_ptr(regs[insn->src_reg].type)) {
+			if (is_tracked_mem_ptr(regs[insn->src_reg].type)) {
 				if (BPF_CLASS(insn->code) != BPF_ALU64)
 					return -EACCES;
 				err = check_reg_arg(regs, insn->dst_reg, DST_OP_NO_MARK);
@@ -2209,25 +2233,30 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 		dst_reg = &regs[insn->dst_reg];
 
 		if (BPF_SRC(insn->code) == BPF_X &&
-		    is_ringbuf_ptr(regs[insn->src_reg].type)) {
-			verbose("ring buffer pointer cannot be an arithmetic operand\n");
+		    is_tracked_mem_ptr(regs[insn->src_reg].type)) {
+			verbose("bounded memory pointer cannot be an arithmetic operand\n");
 			return -EACCES;
 		}
-		if (is_ringbuf_ptr(dst_reg->type)) {
+		if (is_tracked_mem_ptr(dst_reg->type)) {
+			bool direct = dst_reg->type == PTR_TO_MAP_VALUE_DIRECT;
+			u32 size = direct ? dst_reg->map_ptr->value_size : dst_reg->ring_size;
+			s32 start = direct ? dst_reg->direct_off : dst_reg->ring_off;
 			s64 offset;
 
-			if (dst_reg->type != PTR_TO_RINGBUF ||
+			if (dst_reg->type == PTR_TO_RINGBUF_OR_NULL ||
 			    BPF_CLASS(insn->code) != BPF_ALU64 ||
 			    BPF_SRC(insn->code) != BPF_K ||
 			    (opcode != BPF_ADD && opcode != BPF_SUB))
 				return -EACCES;
 
-			offset = (s64)dst_reg->ring_off +
-				 (opcode == BPF_ADD ? insn->imm : -(s64)insn->imm);
-			if (offset < 0 || offset > dst_reg->ring_size)
+			offset = (s64)start + (opcode == BPF_ADD ? insn->imm : -(s64)insn->imm);
+			if (offset < 0 || offset > size)
 				return -EACCES;
 
-			dst_reg->ring_off = offset;
+			if (direct)
+				dst_reg->direct_off = offset;
+			else
+				dst_reg->ring_off = offset;
 			return 0;
 		}
 
@@ -2815,6 +2844,16 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 
 		regs[insn->dst_reg].type = CONST_IMM;
 		regs[insn->dst_reg].imm = imm;
+		return 0;
+	}
+
+	if (insn->src_reg == BPF_PSEUDO_MAP_VALUE) {
+		int idx = insn - env->prog->insnsi;
+		struct bpf_insn_aux_data *aux = &env->insn_aux_data[idx];
+
+		regs[insn->dst_reg].type = PTR_TO_MAP_VALUE_DIRECT;
+		regs[insn->dst_reg].map_ptr = aux->map_ptr;
+		regs[insn->dst_reg].direct_off = aux->map_value_off;
 		return 0;
 	}
 
@@ -3666,6 +3705,7 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 		if (insn[0].code == (BPF_LD | BPF_IMM | BPF_DW)) {
 			struct bpf_map *map;
 			struct fd f;
+			unsigned long address;
 
 			if (i == insn_cnt - 1 || insn[1].code != 0 ||
 			    insn[1].dst_reg != 0 || insn[1].src_reg != 0 ||
@@ -3678,7 +3718,8 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 				/* valid generic load 64-bit imm */
 				goto next_insn;
 
-			if (insn->src_reg != BPF_PSEUDO_MAP_FD) {
+			if (insn->src_reg != BPF_PSEUDO_MAP_FD &&
+			    insn->src_reg != BPF_PSEUDO_MAP_VALUE) {
 				verbose("unrecognized bpf_ld_imm64 insn\n");
 				return -EINVAL;
 			}
@@ -3697,9 +3738,26 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 				return err;
 			}
 
-			/* store map pointer inside BPF_LD_IMM64 instruction */
-			insn[0].imm = (u32) (unsigned long) map;
-			insn[1].imm = ((u64) (unsigned long) map) >> 32;
+			address = (unsigned long)map;
+			if (insn->src_reg == BPF_PSEUDO_MAP_VALUE) {
+				struct bpf_insn_aux_data *aux = &env->insn_aux_data[i];
+				u32 off = insn[1].imm;
+
+				if (map->map_type != BPF_MAP_TYPE_ARRAY ||
+				    map->max_entries != 1 || off >= map->value_size) {
+					fdput(f);
+					verbose("invalid direct map value offset or map type\n");
+					return -EINVAL;
+				}
+
+				aux->map_ptr = map;
+				aux->map_value_off = off;
+				address = (unsigned long)
+					container_of(map, struct bpf_array, map)->value + off;
+			}
+
+			insn[0].imm = (u32)address;
+			insn[1].imm = (u64)address >> 32;
 
 			/* check whether we recorded this map already */
 			for (j = 0; j < env->used_map_cnt; j++)

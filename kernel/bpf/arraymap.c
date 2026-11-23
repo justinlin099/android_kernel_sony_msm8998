@@ -53,15 +53,18 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 {
 	bool percpu = attr->map_type == BPF_MAP_TYPE_PERCPU_ARRAY;
 	u32 elem_size, index_mask, max_entries;
+	u32 allowed_flags = ARRAY_CREATE_FLAG_MASK;
 	bool unpriv = !capable(CAP_SYS_ADMIN);
 	u64 cost, array_size, mask64;
 	struct bpf_array *array;
 	int ret;
 
 	/* check sanity of attributes */
+	if (attr->map_type == BPF_MAP_TYPE_ARRAY)
+		allowed_flags |= BPF_F_RDONLY_PROG;
+
 	if (attr->max_entries == 0 || attr->key_size != 4 ||
-	    attr->value_size == 0 ||
-	    attr->map_flags & ~ARRAY_CREATE_FLAG_MASK)
+	    attr->value_size == 0 || attr->map_flags & ~allowed_flags)
 		return ERR_PTR(-EINVAL);
 
 	if (attr->value_size >= 1 << (KMALLOC_SHIFT_MAX - 1))

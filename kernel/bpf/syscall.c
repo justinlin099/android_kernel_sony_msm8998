@@ -322,6 +322,8 @@ static int map_create(union bpf_attr *attr)
 
 	atomic_set(&map->refcnt, 1);
 	atomic_set(&map->usercnt, 1);
+	mutex_init(&map->freeze_mutex);
+	map->frozen = false;
 
 	err = security_bpf_map_alloc(map);
 	if (err)
@@ -542,6 +544,15 @@ static int map_update_elem(union bpf_attr *attr)
 	if (copy_from_user(value, uvalue, value_size) != 0)
 		goto free_value;
 
+	if (map->map_type == BPF_MAP_TYPE_ARRAY) {
+		mutex_lock(&map->freeze_mutex);
+		if (map->frozen) {
+			mutex_unlock(&map->freeze_mutex);
+			err = -EPERM;
+			goto free_value;
+		}
+	}
+
 	/* must increment bpf_prog_active to avoid kprobe+bpf triggering from
 	 * inside bpf map update or delete otherwise deadlocks are possible
 	 */
@@ -565,6 +576,8 @@ static int map_update_elem(union bpf_attr *attr)
 	}
 	__this_cpu_dec(bpf_prog_active);
 	preempt_enable();
+	if (map->map_type == BPF_MAP_TYPE_ARRAY)
+		mutex_unlock(&map->freeze_mutex);
 
 free_value:
 	kfree(value);
@@ -594,7 +607,7 @@ static int map_delete_elem(union bpf_attr *attr)
 	if (IS_ERR(map))
 		return PTR_ERR(map);
 
-	if (!(f.file->f_mode & FMODE_CAN_WRITE)) {
+	if (!(f.file->f_mode & FMODE_CAN_WRITE) || READ_ONCE(map->frozen)) {
 		err = -EPERM;
 		goto err_put;
 	}
@@ -622,6 +635,44 @@ err_put:
 	fdput(f);
 	return err;
 }
+#define BPF_MAP_FREEZE_LAST_FIELD map_fd
+
+static int bpf_map_freeze(const union bpf_attr *attr)
+{
+	struct bpf_map *map;
+	struct fd f;
+	int err = 0;
+
+	if (CHECK_ATTR(BPF_MAP_FREEZE))
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	f = fdget(attr->map_fd);
+	map = __bpf_map_get(f);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	if (!(f.file->f_mode & FMODE_CAN_WRITE)) {
+		err = -EPERM;
+		goto out;
+	}
+	if (map->map_type != BPF_MAP_TYPE_ARRAY) {
+		err = -EOPNOTSUPP;
+		goto out;
+	}
+
+	mutex_lock(&map->freeze_mutex);
+	if (map->frozen)
+		err = -EBUSY;
+	else
+		WRITE_ONCE(map->frozen, true);
+	mutex_unlock(&map->freeze_mutex);
+out:
+	fdput(f);
+	return err;
+}
+
 
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_MAP_GET_NEXT_KEY_LAST_FIELD next_key
@@ -1373,6 +1424,9 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 		break;
 	case BPF_MAP_GET_NEXT_KEY:
 		err = map_get_next_key(&attr);
+		break;
+	case BPF_MAP_FREEZE:
+		err = bpf_map_freeze(&attr);
 		break;
 	case BPF_PROG_LOAD:
 		err = bpf_prog_load(&attr);
