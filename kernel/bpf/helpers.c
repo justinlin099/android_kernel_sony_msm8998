@@ -104,6 +104,17 @@ const struct bpf_func_proto bpf_ktime_get_ns_proto = {
 	.ret_type	= RET_INTEGER,
 };
 
+BPF_CALL_0(bpf_ktime_get_boot_ns)
+{
+	return ktime_get_boot_fast_ns();
+}
+
+const struct bpf_func_proto bpf_ktime_get_boot_ns_proto = {
+	.func		= bpf_ktime_get_boot_ns,
+	.gpl_only	= true,
+	.ret_type	= RET_INTEGER,
+};
+
 BPF_CALL_0(bpf_get_current_pid_tgid)
 {
 	struct task_struct *task = current;

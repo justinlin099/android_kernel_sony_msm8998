@@ -486,12 +486,12 @@ config UPROBE_EVENT
 	  of perf tools on user space applications.
 
 config BPF_EVENTS
-	depends on BPF_SYSCALL
-	depends on (KPROBE_EVENT || UPROBE_EVENT) && PERF_EVENTS
+	depends on BPF_SYSCALL && PERF_EVENTS && EVENT_TRACING
 	bool
 	default y
 	help
-	  This allows the user to attach BPF programs to kprobe events.
+	  This allows privileged users to attach BPF programs to tracepoint
+	  events and to dynamic probe events where supported.
 
 config PROBE_EVENTS
 	def_bool n
