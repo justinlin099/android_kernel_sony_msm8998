@@ -138,6 +138,10 @@ config DEBUG_INFO_BTF
 	  Encode kernel type information with pahole and expose it read-only
 	  in /sys/kernel/btf/vmlinux for BPF CO-RE programs.
 
+config BPF_DMABUF_ITER
+	def_bool y
+	depends on DEBUG_INFO_BTF && DMA_SHARED_BUFFER = y && ARM64
+
 config DEBUG_INFO_REDUCED
 	bool "Reduce debugging information"
 	depends on DEBUG_INFO

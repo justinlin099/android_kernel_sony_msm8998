@@ -106,6 +106,12 @@ enum bpf_arg_type {
 	ARG_CONST_RINGBUF_SIZE,	/* constant size of the reservation */
 	ARG_PTR_TO_RINGBUF_BASE,	/* non-null, unadjusted reservation */
 	ARG_PTR_TO_RAW_STACK_OR_RINGBUF,	/* memory initialized by the helper */
+	ARG_ITER_KERNEL_READ_SRC,
+	ARG_PTR_TO_SEQ_FILE,
+	ARG_ITER_FMT,
+	ARG_ITER_FMT_SIZE,
+	ARG_ITER_ARGS,
+	ARG_ITER_ARGS_SIZE,
 };
 
 /* type of values returned from helper functions */
@@ -176,6 +182,10 @@ enum bpf_reg_type {
 	PTR_TO_RINGBUF,
 	PTR_TO_RINGBUF_OR_NULL,
 	PTR_TO_MAP_VALUE_DIRECT,
+	PTR_TO_ITER_META,
+	PTR_TO_ITER_BUF_OR_NULL,
+	PTR_TO_ITER_BUF,
+	PTR_TO_SEQ_FILE,
 };
 
 struct bpf_prog;
@@ -206,6 +216,7 @@ struct bpf_prog_aux {
 	atomic_t refcnt;
 	u32 used_map_cnt;
 	u32 max_ctx_offset;
+	u32 expected_attach_type;
 	char name[BPF_OBJ_NAME_LEN];
 	const struct bpf_verifier_ops *ops;
 	struct bpf_map **used_maps;
@@ -334,10 +345,31 @@ struct bpf_link {
 	struct bpf_prog *prog;
 };
 
+void bpf_link_init(struct bpf_link *link, const struct bpf_link_ops *ops,
+		   struct bpf_prog *prog);
 struct bpf_link *bpf_link_inc(struct bpf_link *link);
 void bpf_link_put(struct bpf_link *link);
 int bpf_link_new_fd(struct bpf_link *link);
 struct bpf_link *bpf_link_get_from_fd(u32 ufd);
+
+#ifdef CONFIG_BPF_DMABUF_ITER
+#define BPF_ITER_FMT_MAX 256
+#define BPF_ITER_ARGS_MAX 12
+
+struct seq_file;
+struct bpf_iter_meta {
+	struct seq_file *seq;
+	u64 session_id;
+	u64 seq_num;
+};
+
+u32 bpf_vmlinux_btf_func_id(const char *name);
+bool bpf_dmabuf_iter_target(u32 btf_id);
+int bpf_dmabuf_iter_link_create(u32 prog_fd);
+int bpf_dmabuf_iter_create(u32 link_fd);
+const struct file_operations *bpf_dmabuf_iter_pin_fops(const struct bpf_link *link);
+struct bpf_prog *bpf_dmabuf_iter_file_prog(const struct file *file);
+#endif
 
 #ifdef CONFIG_BPF_EVENTS
 struct bpf_raw_event_map;

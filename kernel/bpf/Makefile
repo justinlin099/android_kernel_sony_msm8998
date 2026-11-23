@@ -8,3 +8,4 @@ obj-$(CONFIG_BPF_SYSCALL) += stackmap.o
 endif
 obj-$(CONFIG_CGROUP_BPF) += cgroup.o
 obj-$(CONFIG_DEBUG_INFO_BTF) += btf_sysfs.o
+obj-$(CONFIG_BPF_DMABUF_ITER) += dmabuf_iter.o

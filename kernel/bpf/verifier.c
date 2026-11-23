@@ -19,6 +19,7 @@
 #include <net/netlink.h>
 #include <linux/file.h>
 #include <linux/vmalloc.h>
+#include <linux/dma-buf.h>
 
 /* bpf_check() is a static code analyzer that walks eBPF program
  * instruction by instruction and updates register/stack state.
@@ -189,6 +190,10 @@ static const char * const reg_type_str[] = {
 	[PTR_TO_RINGBUF]	= "ringbuf",
 	[PTR_TO_RINGBUF_OR_NULL] = "ringbuf_or_null",
 	[PTR_TO_MAP_VALUE_DIRECT] = "map_value_direct",
+	[PTR_TO_ITER_META]	= "iter_meta",
+	[PTR_TO_ITER_BUF_OR_NULL] = "iter_buffer_or_null",
+	[PTR_TO_ITER_BUF]	= "iter_buffer",
+	[PTR_TO_SEQ_FILE]	= "seq_file",
 	[FRAME_PTR]		= "fp",
 	[PTR_TO_STACK]		= "fp",
 	[CONST_IMM]		= "imm",
@@ -537,9 +542,16 @@ static bool is_ringbuf_ptr(enum bpf_reg_type type)
 	return type == PTR_TO_RINGBUF || type == PTR_TO_RINGBUF_OR_NULL;
 }
 
+static bool is_iter_ptr(enum bpf_reg_type type)
+{
+	return type == PTR_TO_ITER_META || type == PTR_TO_ITER_BUF_OR_NULL ||
+	       type == PTR_TO_ITER_BUF || type == PTR_TO_SEQ_FILE;
+}
+
 static bool is_tracked_mem_ptr(enum bpf_reg_type type)
 {
-	return is_ringbuf_ptr(type) || type == PTR_TO_MAP_VALUE_DIRECT;
+	return is_ringbuf_ptr(type) || type == PTR_TO_MAP_VALUE_DIRECT ||
+	       is_iter_ptr(type);
 }
 
 static bool is_spillable_regtype(enum bpf_reg_type type)
@@ -556,6 +568,10 @@ static bool is_spillable_regtype(enum bpf_reg_type type)
 	case PTR_TO_RINGBUF:
 	case PTR_TO_RINGBUF_OR_NULL:
 	case PTR_TO_MAP_VALUE_DIRECT:
+	case PTR_TO_ITER_META:
+	case PTR_TO_ITER_BUF_OR_NULL:
+	case PTR_TO_ITER_BUF:
+	case PTR_TO_SEQ_FILE:
 		return true;
 	default:
 		return false;
@@ -923,6 +939,27 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 		if (!err && t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown_value(state->regs, value_regno);
 
+#ifdef CONFIG_BPF_DMABUF_ITER
+	} else if (reg->type == PTR_TO_ITER_META) {
+		enum bpf_reg_type result = UNKNOWN_VALUE;
+
+		if (t != BPF_READ || size != sizeof(u64))
+			return -EACCES;
+		switch (off) {
+		case offsetof(struct bpf_iter_meta, seq):
+			result = PTR_TO_SEQ_FILE;
+			break;
+		case offsetof(struct bpf_iter_meta, session_id):
+		case offsetof(struct bpf_iter_meta, seq_num):
+			break;
+		default:
+			return -EACCES;
+		}
+		if (value_regno >= 0) {
+			mark_reg_unknown_value(state->regs, value_regno);
+			state->regs[value_regno].type = result;
+		}
+#endif
 	} else if (reg->type == PTR_TO_CTX) {
 		enum bpf_reg_type reg_type = UNKNOWN_VALUE;
 
@@ -936,6 +973,8 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 			mark_reg_unknown_value(state->regs, value_regno);
 			/* note that reg.[id|off|range] == 0 */
 			state->regs[value_regno].type = reg_type;
+			if (reg_type == PTR_TO_ITER_BUF_OR_NULL)
+				state->regs[value_regno].id = ++env->id_gen;
 		}
 
 	} else if (reg->type == FRAME_PTR || reg->type == PTR_TO_STACK) {
@@ -1118,6 +1157,80 @@ static int check_stack_boundary(struct bpf_verifier_env *env, int regno,
 	return 0;
 }
 
+#ifdef CONFIG_BPF_DMABUF_ITER
+static int check_iter_printf_args(struct bpf_verifier_state *state,
+				  const struct bpf_reg_state *args, s64 len)
+{
+	int i, j, off;
+
+	if (len < 0 || len > BPF_ITER_ARGS_MAX * sizeof(u64) || len % sizeof(u64))
+		return -EACCES;
+	if (!len)
+		return 0;
+	if (args->type != PTR_TO_STACK || args->imm < -MAX_BPF_STACK ||
+	    args->imm >= 0 || args->imm % sizeof(u64) || args->imm + len > 0)
+		return -EACCES;
+
+	off = MAX_BPF_STACK + args->imm;
+	for (i = off; i < off + len; i += sizeof(u64)) {
+		u8 type = state->stack_slot_type[i];
+		const struct bpf_reg_state *spill = &state->spilled_regs[i / BPF_REG_SIZE];
+
+		if (type != STACK_MISC &&
+		    (type != STACK_SPILL || spill->type != PTR_TO_STACK ||
+		     spill->imm < -MAX_BPF_STACK || spill->imm >= 0))
+			return -EACCES;
+		for (j = 1; j < sizeof(u64); j++)
+			if (state->stack_slot_type[i + j] != type)
+				return -EACCES;
+	}
+	return 0;
+}
+
+static int check_iter_func_arg(struct bpf_verifier_env *env, u32 regno,
+				enum bpf_arg_type arg_type)
+{
+	struct bpf_verifier_state *state = &env->cur_state;
+	const struct bpf_reg_state *reg = &state->regs[regno];
+	const struct bpf_reg_state *size = &state->regs[BPF_REG_2];
+
+	switch (arg_type) {
+	case ARG_ITER_KERNEL_READ_SRC:
+		if (size->type != CONST_IMM || size->imm <= 0 ||
+		    size->imm > MAX_BPF_STACK)
+			return -EACCES;
+		if (bpf_reg_is_scalar(reg))
+			return 0;
+		if (reg->type == PTR_TO_ITER_BUF &&
+		    reg->direct_off + size->imm <= sizeof(struct dma_buf))
+			return 0;
+		return -EACCES;
+	case ARG_PTR_TO_SEQ_FILE:
+		return reg->type == PTR_TO_SEQ_FILE ? 0 : -EACCES;
+	case ARG_ITER_FMT:
+		if (reg->type != PTR_TO_MAP_VALUE_DIRECT ||
+		    !(reg->map_ptr->map_flags & BPF_F_RDONLY_PROG) ||
+		    !READ_ONCE(reg->map_ptr->frozen))
+			return -EACCES;
+		return 0;
+	case ARG_ITER_FMT_SIZE:
+		if (reg->type != CONST_IMM || reg->imm <= 0 || reg->imm > BPF_ITER_FMT_MAX)
+			return -EACCES;
+		return check_map_access(env, regno - 1, state->regs[regno - 1].direct_off,
+					reg->imm);
+	case ARG_ITER_ARGS:
+		return reg->type == PTR_TO_STACK || (reg->type == CONST_IMM && !reg->imm)
+			? 0 : -EACCES;
+	case ARG_ITER_ARGS_SIZE:
+		if (reg->type != CONST_IMM)
+			return -EACCES;
+		return check_iter_printf_args(state, &state->regs[regno - 1], reg->imm);
+	default:
+		return -EFAULT;
+	}
+}
+#endif
+
 static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 			  enum bpf_arg_type arg_type,
 			  struct bpf_call_arg_meta *meta)
@@ -1133,6 +1246,11 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 		verbose("R%d !read_ok\n", regno);
 		return -EACCES;
 	}
+
+#ifdef CONFIG_BPF_DMABUF_ITER
+	if (arg_type >= ARG_ITER_KERNEL_READ_SRC && arg_type <= ARG_ITER_ARGS_SIZE)
+		return check_iter_func_arg(env, regno, arg_type);
+#endif
 
 	if (arg_type == ARG_CONST_RINGBUF_SIZE) {
 		if (type != CONST_IMM || reg->imm < 0 || reg->imm > UINT_MAX / 4) {
@@ -2237,6 +2355,29 @@ static int check_alu_op(struct bpf_verifier_env *env, struct bpf_insn *insn)
 			verbose("bounded memory pointer cannot be an arithmetic operand\n");
 			return -EACCES;
 		}
+#ifdef CONFIG_BPF_DMABUF_ITER
+		if (dst_reg->type == PTR_TO_ITER_BUF) {
+			s64 delta = insn->imm, offset;
+
+			if (BPF_CLASS(insn->code) != BPF_ALU64 ||
+			    (opcode != BPF_ADD && opcode != BPF_SUB))
+				return -EACCES;
+			if (BPF_SRC(insn->code) == BPF_X) {
+				if (regs[insn->src_reg].type != CONST_IMM)
+					return -EACCES;
+				delta = regs[insn->src_reg].imm;
+			}
+			if (delta < -(s64)sizeof(struct dma_buf) || delta > (s64)sizeof(struct dma_buf))
+				return -EACCES;
+			offset = dst_reg->direct_off + (opcode == BPF_ADD ? delta : -delta);
+			if (offset < 0 || offset > sizeof(struct dma_buf))
+				return -EACCES;
+			dst_reg->direct_off = offset;
+			return 0;
+		}
+#endif
+		if (is_iter_ptr(dst_reg->type))
+			return -EACCES;
 		if (is_tracked_mem_ptr(dst_reg->type)) {
 			bool direct = dst_reg->type == PTR_TO_MAP_VALUE_DIRECT;
 			u32 size = direct ? dst_reg->map_ptr->value_size : dst_reg->ring_size;
@@ -2673,6 +2814,31 @@ static int check_jmp32_cond(struct bpf_verifier_env *env,
 	return 0;
 }
 
+#ifdef CONFIG_BPF_DMABUF_ITER
+static void refine_iter_buf(struct bpf_reg_state *reg, u32 id, bool nonnull)
+{
+	if (reg->type != PTR_TO_ITER_BUF_OR_NULL || reg->id != id)
+		return;
+	if (nonnull) {
+		reg->type = PTR_TO_ITER_BUF;
+		return;
+	}
+	memset(reg, 0, sizeof(*reg));
+	reg->type = CONST_IMM;
+}
+
+static void refine_iter_buf_branch(struct bpf_verifier_state *state, u32 id, bool nonnull)
+{
+	int i;
+
+	for (i = 0; i < MAX_BPF_REG; i++)
+		refine_iter_buf(&state->regs[i], id, nonnull);
+	for (i = 0; i < MAX_BPF_STACK; i += BPF_REG_SIZE)
+		if (state->stack_slot_type[i] == STACK_SPILL)
+			refine_iter_buf(&state->spilled_regs[i / BPF_REG_SIZE], id, nonnull);
+}
+#endif
+
 static int check_cond_jmp_op(struct bpf_verifier_env *env,
 			     struct bpf_insn *insn, int *insn_idx)
 {
@@ -2716,6 +2882,22 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
 		return err;
 
 	dst_reg = &regs[insn->dst_reg];
+
+#ifdef CONFIG_BPF_DMABUF_ITER
+	if (dst_reg->type == PTR_TO_ITER_BUF_OR_NULL) {
+		u32 id = dst_reg->id;
+
+		if (jmp32 || (opcode != BPF_JEQ && opcode != BPF_JNE) ||
+		    BPF_SRC(insn->code) != BPF_K || insn->imm)
+			return -EACCES;
+		other_branch = push_stack(env, *insn_idx + insn->off + 1, *insn_idx);
+		if (!other_branch)
+			return -EFAULT;
+		refine_iter_buf_branch(other_branch, id, opcode == BPF_JNE);
+		refine_iter_buf_branch(this_branch, id, opcode == BPF_JEQ);
+		return 0;
+	}
+#endif
 
 	if (is_ringbuf_ptr(dst_reg->type)) {
 		bool equal = opcode == BPF_JEQ;

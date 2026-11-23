@@ -91,6 +91,8 @@ enum bpf_cmd {
 	BPF_OBJ_GET_INFO_BY_FD = 15,
 	BPF_RAW_TRACEPOINT_OPEN = 17,
 	BPF_MAP_FREEZE = 22,
+	BPF_LINK_CREATE = 28,
+	BPF_ITER_CREATE = 33,
 };
 
 enum bpf_map_type {
@@ -125,12 +127,14 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_CGROUP_SKB,
 	BPF_PROG_TYPE_CGROUP_SOCK,
 	BPF_PROG_TYPE_RAW_TRACEPOINT = 17,
+	BPF_PROG_TYPE_TRACING = 26,
 };
 
 enum bpf_attach_type {
 	BPF_CGROUP_INET_INGRESS,
 	BPF_CGROUP_INET_EGRESS,
 	BPF_CGROUP_INET_SOCK_CREATE,
+	BPF_TRACE_ITER = 28,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -228,6 +232,16 @@ union bpf_attr {
 		__u32		kern_version;	/* checked when prog_type=kprobe */
 		__u32		prog_flags;
 		char		prog_name[BPF_OBJ_NAME_LEN];
+		__u32		prog_ifindex;
+		__u32		expected_attach_type;
+		__u32		prog_btf_fd;
+		__u32		func_info_rec_size;
+		__aligned_u64	func_info;
+		__u32		func_info_cnt;
+		__u32		line_info_rec_size;
+		__aligned_u64	line_info;
+		__u32		line_info_cnt;
+		__u32		attach_btf_id;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */
@@ -253,6 +267,20 @@ union bpf_attr {
 		__u64 name;
 		__u32 prog_fd;
 	} raw_tracepoint;
+
+	struct {
+		__u32		prog_fd;
+		__u32		target_fd;
+		__u32		attach_type;
+		__u32		flags;
+		__aligned_u64	iter_info;
+		__u32		iter_info_len;
+	} link_create;
+
+	struct {
+		__u32		link_fd;
+		__u32		flags;
+	} iter_create;
 } __attribute__((aligned(8)));
 
 struct bpf_map_info {
@@ -610,7 +638,10 @@ enum bpf_func_id {
 	BPF_FUNC_get_socket_uid,
 
 	/* Includes time spent in suspend (CLOCK_BOOTTIME). */
+	BPF_FUNC_probe_read_kernel = 113,
+	BPF_FUNC_probe_read_kernel_str = 115,
 	BPF_FUNC_ktime_get_boot_ns = 125,
+	BPF_FUNC_seq_printf = 126,
 	BPF_FUNC_ringbuf_reserve = 131,
 	BPF_FUNC_ringbuf_submit = 132,
 	BPF_FUNC_ringbuf_discard = 133,

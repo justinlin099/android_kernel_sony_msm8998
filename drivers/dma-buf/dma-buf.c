@@ -69,6 +69,32 @@ static void dma_buf_name_put(const char *name)
 static struct dma_buf_list db_list;
 static struct vfsmount *dma_buf_mnt;
 
+#ifdef CONFIG_BPF_DMABUF_ITER
+/* Return the next live buffer with a file reference, consuming previous. */
+struct dma_buf *dma_buf_iter_next(struct dma_buf *previous)
+{
+	struct dma_buf *result = NULL;
+	struct list_head *node;
+
+	mutex_lock(&db_list.lock);
+	node = previous ? previous->list_node.next : db_list.head.next;
+	for (; node != &db_list.head; node = node->next) {
+		struct dma_buf *buffer = list_entry(node, struct dma_buf, list_node);
+
+		/* A buffer whose final fput is pending still appears in the list. */
+		if (get_file_rcu(buffer->file)) {
+			result = buffer;
+			break;
+		}
+	}
+	mutex_unlock(&db_list.lock);
+
+	if (previous)
+		dma_buf_put(previous);
+	return result;
+}
+#endif
+
 static const struct dentry_operations dma_buf_dentry_ops = {
 	.d_dname = simple_dname,
 };

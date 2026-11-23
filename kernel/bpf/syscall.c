@@ -952,7 +952,7 @@ struct bpf_prog *bpf_prog_get_type(u32 ufd, enum bpf_prog_type type)
 EXPORT_SYMBOL_GPL(bpf_prog_get_type);
 
 /* last field in 'union bpf_attr' used by this command */
-#define BPF_PROG_LOAD_LAST_FIELD prog_name
+#define BPF_PROG_LOAD_LAST_FIELD attach_btf_id
 
 static int bpf_prog_load(union bpf_attr *attr)
 {
@@ -962,8 +962,31 @@ static int bpf_prog_load(union bpf_attr *attr)
 	char license[128];
 	bool is_gpl;
 
-	if (CHECK_ATTR(BPF_PROG_LOAD) || attr->prog_flags)
+	if (CHECK_ATTR(BPF_PROG_LOAD) || attr->prog_flags ||
+	    attr->prog_ifindex || attr->prog_btf_fd || attr->func_info_rec_size ||
+	    attr->func_info || attr->func_info_cnt || attr->line_info_rec_size ||
+	    attr->line_info || attr->line_info_cnt)
 		return -EINVAL;
+
+	if (type == BPF_PROG_TYPE_TRACING) {
+#ifdef CONFIG_BPF_DMABUF_ITER
+		if (attr->expected_attach_type != BPF_TRACE_ITER ||
+		    !bpf_dmabuf_iter_target(attr->attach_btf_id))
+			return -EINVAL;
+#else
+		return -EOPNOTSUPP;
+#endif
+	} else if (attr->attach_btf_id) {
+		return -EINVAL;
+	} else if (attr->expected_attach_type) {
+		if (type == BPF_PROG_TYPE_CGROUP_SKB) {
+			if (attr->expected_attach_type != BPF_CGROUP_INET_EGRESS)
+				return -EINVAL;
+		} else if (type != BPF_PROG_TYPE_CGROUP_SOCK ||
+			   attr->expected_attach_type != BPF_CGROUP_INET_SOCK_CREATE) {
+			return -EINVAL;
+		}
+	}
 
 	/* copy eBPF program license from user space */
 	if (strncpy_from_user(license, u64_to_ptr(attr->license),
@@ -1015,6 +1038,7 @@ static int bpf_prog_load(union bpf_attr *attr)
 
 	atomic_set(&prog->aux->refcnt, 1);
 	prog->gpl_compatible = is_gpl ? 1 : 0;
+	prog->aux->expected_attach_type = attr->expected_attach_type;
 
 	/* find program type: socket_filter vs tracing_filter */
 	err = find_prog_type(type, prog);
@@ -1098,6 +1122,11 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 					 BPF_PROG_TYPE_CGROUP_SKB);
 		if (IS_ERR(prog))
 			return PTR_ERR(prog);
+		if (prog->aux->expected_attach_type &&
+		    prog->aux->expected_attach_type != attr->attach_type) {
+			bpf_prog_put(prog);
+			return -EINVAL;
+		}
 
 		cgrp = cgroup_get_from_fd(attr->target_fd);
 		if (IS_ERR(cgrp)) {
@@ -1249,7 +1278,8 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 
 static void bpf_link_free(struct bpf_link *link)
 {
-	link->ops->release(link);
+	if (link->ops->release)
+		link->ops->release(link);
 	bpf_prog_put(link->prog);
 	link->ops->dealloc(link);
 }
@@ -1259,6 +1289,15 @@ static void bpf_link_free_deferred(struct work_struct *work)
 	struct bpf_link *link = container_of(work, struct bpf_link, work);
 
 	bpf_link_free(link);
+}
+
+void bpf_link_init(struct bpf_link *link, const struct bpf_link_ops *ops,
+		   struct bpf_prog *prog)
+{
+	link->prog = prog;
+	link->ops = ops;
+	atomic_set(&link->refcnt, 1);
+	INIT_WORK(&link->work, bpf_link_free_deferred);
 }
 
 struct bpf_link *bpf_link_inc(struct bpf_link *link)
@@ -1302,7 +1341,11 @@ struct bpf_prog *bpf_file_prog(const struct file *file)
 		link = file->private_data;
 		return link->prog;
 	}
+#ifdef CONFIG_BPF_DMABUF_ITER
+	return bpf_dmabuf_iter_file_prog(file);
+#else
 	return NULL;
+#endif
 }
 
 struct bpf_link *bpf_link_get_from_fd(u32 ufd)
@@ -1404,10 +1447,7 @@ static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
 		goto free_tracepoint;
 
 	raw_tp->event = event;
-	raw_tp->link.prog = prog;
-	raw_tp->link.ops = &bpf_raw_tracepoint_link_ops;
-	atomic_set(&raw_tp->link.refcnt, 1);
-	INIT_WORK(&raw_tp->link.work, bpf_link_free_deferred);
+	bpf_link_init(&raw_tp->link, &bpf_raw_tracepoint_link_ops, prog);
 
 	fd = bpf_link_new_fd(&raw_tp->link);
 	if (fd < 0)
@@ -1419,6 +1459,30 @@ free_tracepoint:
 put_prog:
 	bpf_prog_put(prog);
 	return fd;
+}
+#endif
+
+#ifdef CONFIG_BPF_DMABUF_ITER
+#define BPF_LINK_CREATE_LAST_FIELD link_create.iter_info_len
+#define BPF_ITER_CREATE_LAST_FIELD iter_create.flags
+
+static int bpf_link_create(const union bpf_attr *attr)
+{
+	if (CHECK_ATTR(BPF_LINK_CREATE) || attr->link_create.target_fd ||
+	    attr->link_create.flags || attr->link_create.iter_info ||
+	    attr->link_create.iter_info_len ||
+	    attr->link_create.attach_type != BPF_TRACE_ITER)
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+	return bpf_dmabuf_iter_link_create(attr->link_create.prog_fd);
+}
+
+static int bpf_iter_create(const union bpf_attr *attr)
+{
+	if (CHECK_ATTR(BPF_ITER_CREATE) || attr->iter_create.flags)
+		return -EINVAL;
+	return bpf_dmabuf_iter_create(attr->iter_create.link_fd);
 }
 #endif
 
@@ -1479,6 +1543,14 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 	case BPF_OBJ_GET_INFO_BY_FD:
 		err = bpf_obj_get_info_by_fd(&attr, uattr);
 		break;
+#ifdef CONFIG_BPF_DMABUF_ITER
+	case BPF_LINK_CREATE:
+		err = bpf_link_create(&attr);
+		break;
+	case BPF_ITER_CREATE:
+		err = bpf_iter_create(&attr);
+		break;
+#endif
 #ifdef CONFIG_BPF_EVENTS
 	case BPF_RAW_TRACEPOINT_OPEN:
 		err = bpf_raw_tracepoint_open(&attr);

@@ -242,4 +242,8 @@ void *dma_buf_vmap(struct dma_buf *);
 void dma_buf_vunmap(struct dma_buf *, void *vaddr);
 int dma_buf_debugfs_create_file(const char *name,
 				int (*write)(struct seq_file *));
+#ifdef CONFIG_BPF_DMABUF_ITER
+struct dma_buf *dma_buf_iter_next(struct dma_buf *previous);
+#endif
+
 #endif /* __DMA_BUF_H__ */

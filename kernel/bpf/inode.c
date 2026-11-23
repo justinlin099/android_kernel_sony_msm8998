@@ -164,6 +164,14 @@ static int bpf_mkobj_ops(struct inode *dir, struct dentry *dentry,
 
 	inode->i_op = iops;
 	inode->i_private = dentry->d_fsdata;
+#ifdef CONFIG_BPF_DMABUF_ITER
+	if (iops == &bpf_link_iops) {
+		const struct file_operations *fops = bpf_dmabuf_iter_pin_fops(inode->i_private);
+
+		if (fops)
+			inode->i_fop = fops;
+	}
+#endif
 
 	d_instantiate(dentry, inode);
 	dget(dentry);
