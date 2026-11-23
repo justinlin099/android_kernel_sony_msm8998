@@ -138,10 +138,12 @@ struct bpf_verifier_stack_elem {
 	int insn_idx;
 	int prev_insn_idx;
 	struct bpf_verifier_stack_elem *next;
+	struct bpf_verifier_state_list *loop_checkpoint;
 };
 
 #define BPF_COMPLEXITY_LIMIT_INSNS	98304
 #define BPF_COMPLEXITY_LIMIT_STACK	1024
+#define BPF_LOOP_STATE_CACHE_LIMIT	512
 
 struct bpf_call_arg_meta {
 	struct bpf_map *map_ptr;
@@ -434,6 +436,7 @@ static struct bpf_verifier_state *push_stack(struct bpf_verifier_env *env,
 	memcpy(&elem->st, &env->cur_state, sizeof(env->cur_state));
 	elem->insn_idx = insn_idx;
 	elem->prev_insn_idx = prev_insn_idx;
+	elem->loop_checkpoint = env->pending_loop_states;
 	elem->next = env->head;
 	env->head = elem;
 	env->stack_size++;
@@ -3499,14 +3502,6 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 	struct bpf_verifier_state_list *new_sl;
 	struct bpf_verifier_state_list *sl;
 
-	/* The legacy cache considers a state safe before all of its
-	 * descendants have exited. With a loop, revisiting one of those
-	 * states cannot prove termination. Explore each path instead;
-	 * the instruction and branch limits still bound the analysis.
-	 */
-	if (env->has_loop)
-		return 0;
-
 	sl = env->explored_states[insn_idx];
 	if (!sl)
 		/* this 'insn_idx' instruction wasn't marked, so we will not
@@ -3515,7 +3510,9 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		return 0;
 
 	while (sl != STATE_LIST_MARK) {
-		if (states_equal(env, &sl->state, &env->cur_state))
+		if (env->has_loop ?
+		    !memcmp(&sl->state, &env->cur_state, sizeof(sl->state)) :
+		    states_equal(env, &sl->state, &env->cur_state))
 			/* reached equivalent register/stack state,
 			 * prune the search
 			 */
@@ -3523,21 +3520,47 @@ static int is_state_visited(struct bpf_verifier_env *env, int insn_idx)
 		sl = sl->next;
 	}
 
-	/* there were no equivalent states, remember current one.
-	 * technically the current state is not proven to be safe yet,
-	 * but it will either reach bpf_exit (which means it's safe) or
-	 * it will be rejected. Since there are no loops, we won't be
-	 * seeing this 'insn_idx' instruction again on the way to bpf_exit
+	/* Remember the state. For a loop it stays pending until all
+	 * descendants have passed verification.
 	 */
+	if (env->has_loop &&
+	    env->loop_state_count == BPF_LOOP_STATE_CACHE_LIMIT)
+		return 0;
 	new_sl = kmalloc(sizeof(struct bpf_verifier_state_list), GFP_USER);
 	if (!new_sl)
 		return -ENOMEM;
 
 	/* add new state to the head of linked list */
 	memcpy(&new_sl->state, &env->cur_state, sizeof(env->cur_state));
-	new_sl->next = env->explored_states[insn_idx];
-	env->explored_states[insn_idx] = new_sl;
+	if (env->has_loop) {
+		new_sl->insn_idx = insn_idx;
+		new_sl->next = env->pending_loop_states;
+		env->pending_loop_states = new_sl;
+		env->loop_state_count++;
+	} else {
+		new_sl->next = env->explored_states[insn_idx];
+		env->explored_states[insn_idx] = new_sl;
+	}
 	return 0;
+}
+
+/*
+ * At a successful exit, entries after the newest pending branch's checkpoint
+ * have no unexplored descendants. Only those entries can be reused in a loop.
+ * Revisiting an entry still on the active path does not establish termination.
+ */
+static void finish_loop_path(struct bpf_verifier_env *env)
+{
+	struct bpf_verifier_state_list *checkpoint;
+	struct bpf_verifier_state_list *state;
+
+	checkpoint = env->head ? env->head->loop_checkpoint : NULL;
+	while (env->pending_loop_states != checkpoint) {
+		state = env->pending_loop_states;
+		env->pending_loop_states = state->next;
+		state->next = env->explored_states[state->insn_idx];
+		env->explored_states[state->insn_idx] = state;
+	}
 }
 
 static int ext_analyzer_insn_hook(struct bpf_verifier_env *env,
@@ -3803,6 +3826,8 @@ static int do_check(struct bpf_verifier_env *env)
 				}
 
 process_bpf_exit:
+				if (env->has_loop)
+					finish_loop_path(env);
 				insn_idx = pop_stack(env, &prev_insn_idx);
 				if (insn_idx < 0) {
 					break;
@@ -4250,6 +4275,11 @@ static void free_states(struct bpf_verifier_env *env)
 	struct bpf_verifier_state_list *sl, *sln;
 	int i;
 
+	while (env->pending_loop_states) {
+		sl = env->pending_loop_states;
+		env->pending_loop_states = sl->next;
+		kfree(sl);
+	}
 	if (!env->explored_states)
 		return;
 
