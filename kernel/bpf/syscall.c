@@ -10,6 +10,7 @@
  * General Public License for more details.
  */
 #include <linux/bpf.h>
+#include <linux/ctype.h>
 #include <linux/syscalls.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -200,12 +201,14 @@ static void bpf_map_show_fdinfo(struct seq_file *m, struct file *filp)
                    "key_size:\t%u\n"
                    "value_size:\t%u\n"
                    "max_entries:\t%u\n"
-                   "map_flags:\t%#x\n",
+                   "map_flags:\t%#x\n"
+                   "map_name:\t%s\n",
                    map->map_type,
                    map->key_size,
                    map->value_size,
                    map->max_entries,
-                   map->map_flags);
+                   map->map_flags,
+                   map->name);
 }
 #endif
 
@@ -299,7 +302,23 @@ int bpf_get_file_flag(int flags)
 		   offsetof(union bpf_attr, CMD##_LAST_FIELD) - \
 		   sizeof(attr->CMD##_LAST_FIELD)) != NULL
 
-#define BPF_MAP_CREATE_LAST_FIELD map_flags
+static int bpf_obj_name_cpy(char *dst, const char *src)
+{
+	size_t len = strnlen(src, BPF_OBJ_NAME_LEN);
+	size_t i;
+
+	if (len == BPF_OBJ_NAME_LEN)
+		return -EINVAL;
+	for (i = 0; i < len; i++)
+		if (!isalnum(src[i]) && src[i] != '_' && src[i] != '.')
+			return -EINVAL;
+
+	memset(dst, 0, BPF_OBJ_NAME_LEN);
+	memcpy(dst, src, len);
+	return 0;
+}
+
+#define BPF_MAP_CREATE_LAST_FIELD map_name
 /* called via syscall */
 static int map_create(union bpf_attr *attr)
 {
@@ -307,8 +326,7 @@ static int map_create(union bpf_attr *attr)
 	int f_flags;
 	int err;
 
-	err = CHECK_ATTR(BPF_MAP_CREATE);
-	if (err)
+	if (CHECK_ATTR(BPF_MAP_CREATE) || attr->inner_map_fd || attr->numa_node)
 		return -EINVAL;
 
 	f_flags = bpf_get_file_flag(attr->map_flags);
@@ -319,6 +337,10 @@ static int map_create(union bpf_attr *attr)
 	map = find_and_alloc_map(attr);
 	if (IS_ERR(map))
 		return PTR_ERR(map);
+
+	err = bpf_obj_name_cpy(map->name, attr->map_name);
+	if (err)
+		goto free_map_nouncharge;
 
 	atomic_set(&map->refcnt, 1);
 	atomic_set(&map->usercnt, 1);
@@ -842,7 +864,19 @@ static int bpf_prog_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+#ifdef CONFIG_PROC_FS
+static void bpf_prog_show_fdinfo(struct seq_file *m, struct file *filp)
+{
+	const struct bpf_prog *prog = filp->private_data;
+
+	seq_printf(m, "prog_type:\t%u\nprog_name:\t%s\n", prog->type, prog->aux->name);
+}
+#endif
+
 const struct file_operations bpf_prog_fops = {
+#ifdef CONFIG_PROC_FS
+	.show_fdinfo	= bpf_prog_show_fdinfo,
+#endif
         .release = bpf_prog_release,
 	.read		= bpf_dummy_read,
 	.write		= bpf_dummy_write,
@@ -918,7 +952,7 @@ struct bpf_prog *bpf_prog_get_type(u32 ufd, enum bpf_prog_type type)
 EXPORT_SYMBOL_GPL(bpf_prog_get_type);
 
 /* last field in 'union bpf_attr' used by this command */
-#define	BPF_PROG_LOAD_LAST_FIELD kern_version
+#define BPF_PROG_LOAD_LAST_FIELD prog_name
 
 static int bpf_prog_load(union bpf_attr *attr)
 {
@@ -928,7 +962,7 @@ static int bpf_prog_load(union bpf_attr *attr)
 	char license[128];
 	bool is_gpl;
 
-	if (CHECK_ATTR(BPF_PROG_LOAD))
+	if (CHECK_ATTR(BPF_PROG_LOAD) || attr->prog_flags)
 		return -EINVAL;
 
 	/* copy eBPF program license from user space */
@@ -956,6 +990,10 @@ static int bpf_prog_load(union bpf_attr *attr)
 	prog = bpf_prog_alloc(bpf_prog_size(attr->insn_cnt), GFP_USER);
 	if (!prog)
 		return -ENOMEM;
+
+	err = bpf_obj_name_cpy(prog->aux->name, attr->prog_name);
+	if (err)
+		goto free_prog_nouncharge;
 
 	err = security_bpf_prog_alloc(prog->aux);
 	if (err)
@@ -1179,6 +1217,7 @@ static int bpf_map_get_info_by_fd(struct bpf_map *map,
 	info.value_size = map->value_size;
 	info.max_entries = map->max_entries;
 	info.map_flags = map->map_flags;
+	memcpy(info.name, map->name, sizeof(info.name));
 
 	if (copy_to_user(uinfo, &info, info_len) ||
 	    put_user(info_len, &uattr->info.info_len))
