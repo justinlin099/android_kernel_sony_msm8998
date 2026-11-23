@@ -2702,6 +2702,12 @@ sk_filter_func_proto(enum bpf_func_id func_id)
 	switch (func_id) {
 	case BPF_FUNC_skb_load_bytes:
 		return &bpf_skb_load_bytes_proto;
+	case BPF_FUNC_ringbuf_reserve:
+		return capable(CAP_SYS_ADMIN) ? &bpf_ringbuf_reserve_proto : NULL;
+	case BPF_FUNC_ringbuf_submit:
+		return capable(CAP_SYS_ADMIN) ? &bpf_ringbuf_submit_proto : NULL;
+	case BPF_FUNC_ringbuf_discard:
+		return capable(CAP_SYS_ADMIN) ? &bpf_ringbuf_discard_proto : NULL;
 	default:
 		return bpf_base_func_proto(func_id);
 	}
