@@ -89,6 +89,7 @@ enum bpf_cmd {
 	BPF_PROG_ATTACH,
 	BPF_PROG_DETACH,
 	BPF_OBJ_GET_INFO_BY_FD = 15,
+	BPF_RAW_TRACEPOINT_OPEN = 17,
 };
 
 enum bpf_map_type {
@@ -122,6 +123,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_PERF_EVENT,
 	BPF_PROG_TYPE_CGROUP_SKB,
 	BPF_PROG_TYPE_CGROUP_SOCK,
+	BPF_PROG_TYPE_RAW_TRACEPOINT = 17,
 };
 
 enum bpf_attach_type {
@@ -236,6 +238,11 @@ union bpf_attr {
 		__u32		info_len;
 		__aligned_u64	info;
 	} info;
+
+	struct { /* BPF_RAW_TRACEPOINT_OPEN */
+		__u64 name;
+		__u32 prog_fd;
+	} raw_tracepoint;
 } __attribute__((aligned(8)));
 
 struct bpf_map_info {

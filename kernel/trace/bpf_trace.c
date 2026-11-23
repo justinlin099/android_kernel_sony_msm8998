@@ -13,6 +13,7 @@
 #include <linux/filter.h>
 #include <linux/uaccess.h>
 #include <linux/ctype.h>
+#include <trace/events/power.h>
 #include "trace.h"
 
 /**
@@ -752,11 +753,86 @@ static struct bpf_prog_type_list perf_event_tl = {
 	.type	= BPF_PROG_TYPE_PERF_EVENT,
 };
 
+/* The two Android wakeup events expose name and combined event count. */
+#define BPF_WAKEUP_RAW_ARGS_SIZE (2 * sizeof(u64))
+
+struct bpf_raw_event_map {
+	struct tracepoint *tp;
+};
+
+static const struct bpf_raw_event_map bpf_raw_wakeup_events[] = {
+	{ .tp = &__tracepoint_wakeup_source_activate },
+	{ .tp = &__tracepoint_wakeup_source_deactivate },
+};
+
+static bool raw_tp_prog_is_valid_access(int off, int size, enum bpf_access_type type,
+				       enum bpf_reg_type *reg_type)
+{
+	return type == BPF_READ && off >= 0 &&
+	       off + size <= BPF_WAKEUP_RAW_ARGS_SIZE && off % size == 0;
+}
+
+static const struct bpf_verifier_ops raw_tracepoint_prog_ops = {
+	.get_func_proto = tracing_func_proto,
+	.is_valid_access = raw_tp_prog_is_valid_access,
+};
+
+static struct bpf_prog_type_list raw_tracepoint_tl = {
+	.ops = &raw_tracepoint_prog_ops,
+	.type = BPF_PROG_TYPE_RAW_TRACEPOINT,
+};
+
+static notrace void bpf_raw_wakeup_source(void *data, const char *name,
+					unsigned int state)
+{
+	struct bpf_prog *prog = data;
+	u64 args[] = { (unsigned long)name, state };
+
+	preempt_disable();
+	if (likely(__this_cpu_inc_return(bpf_prog_active) == 1)) {
+		rcu_read_lock();
+		BPF_PROG_RUN(prog, args);
+		rcu_read_unlock();
+	}
+	__this_cpu_dec(bpf_prog_active);
+	preempt_enable();
+}
+
+const struct bpf_raw_event_map *bpf_find_raw_tracepoint(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(bpf_raw_wakeup_events); i++)
+		if (!strcmp(name, bpf_raw_wakeup_events[i].tp->name))
+			return &bpf_raw_wakeup_events[i];
+	return NULL;
+}
+
+int bpf_raw_tracepoint_register(const struct bpf_raw_event_map *event,
+				struct bpf_prog *prog)
+{
+	check_trace_callback_type_wakeup_source_activate(bpf_raw_wakeup_source);
+	check_trace_callback_type_wakeup_source_deactivate(bpf_raw_wakeup_source);
+
+	if (prog->aux->max_ctx_offset > BPF_WAKEUP_RAW_ARGS_SIZE)
+		return -EINVAL;
+
+	return tracepoint_probe_register(event->tp, bpf_raw_wakeup_source, prog);
+}
+
+void bpf_raw_tracepoint_unregister(const struct bpf_raw_event_map *event,
+				   struct bpf_prog *prog)
+{
+	WARN_ON_ONCE(tracepoint_probe_unregister(event->tp, bpf_raw_wakeup_source, prog));
+	tracepoint_synchronize_unregister();
+}
+
 static int __init register_kprobe_prog_ops(void)
 {
 	bpf_register_prog_type(&kprobe_tl);
 	bpf_register_prog_type(&tracepoint_tl);
 	bpf_register_prog_type(&perf_event_tl);
+	bpf_register_prog_type(&raw_tracepoint_tl);
 	return 0;
 }
 late_initcall(register_kprobe_prog_ops);

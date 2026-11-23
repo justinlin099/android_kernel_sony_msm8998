@@ -313,6 +313,16 @@ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
 void bpf_register_map_type(struct bpf_map_type_list *tl);
 
 bool bpf_is_map_file(const struct file *file);
+
+#ifdef CONFIG_BPF_EVENTS
+struct bpf_raw_event_map;
+const struct bpf_raw_event_map *bpf_find_raw_tracepoint(const char *name);
+int bpf_raw_tracepoint_register(const struct bpf_raw_event_map *event,
+				struct bpf_prog *prog);
+void bpf_raw_tracepoint_unregister(const struct bpf_raw_event_map *event,
+				   struct bpf_prog *prog);
+#endif
+
 extern const struct bpf_func_proto bpf_ringbuf_reserve_proto;
 extern const struct bpf_func_proto bpf_ringbuf_submit_proto;
 extern const struct bpf_func_proto bpf_ringbuf_discard_proto;

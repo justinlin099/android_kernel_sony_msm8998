@@ -1157,6 +1157,82 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 	return err;
 }
 
+#ifdef CONFIG_BPF_EVENTS
+struct bpf_raw_tracepoint {
+	const struct bpf_raw_event_map *event;
+	struct bpf_prog *prog;
+};
+
+static int bpf_raw_tracepoint_release(struct inode *inode, struct file *filp)
+{
+	struct bpf_raw_tracepoint *raw_tp = filp->private_data;
+
+	bpf_raw_tracepoint_unregister(raw_tp->event, raw_tp->prog);
+	bpf_prog_put(raw_tp->prog);
+	kfree(raw_tp);
+	return 0;
+}
+
+static const struct file_operations bpf_raw_tp_fops = {
+	.release = bpf_raw_tracepoint_release,
+};
+
+#define BPF_RAW_TRACEPOINT_OPEN_LAST_FIELD raw_tracepoint.prog_fd
+
+static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
+{
+	const struct bpf_raw_event_map *event;
+	struct bpf_raw_tracepoint *raw_tp;
+	struct bpf_prog *prog;
+	char name[128];
+	long length;
+	int fd;
+
+	if (CHECK_ATTR(BPF_RAW_TRACEPOINT_OPEN))
+		return -EINVAL;
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	length = strncpy_from_user(name, u64_to_user_ptr(attr->raw_tracepoint.name),
+				   sizeof(name));
+	if (length < 0)
+		return length;
+	if (length == sizeof(name))
+		return -ENAMETOOLONG;
+
+	event = bpf_find_raw_tracepoint(name);
+	if (!event)
+		return -ENOENT;
+
+	prog = bpf_prog_get_type(attr->raw_tracepoint.prog_fd, BPF_PROG_TYPE_RAW_TRACEPOINT);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	raw_tp = kzalloc(sizeof(*raw_tp), GFP_USER);
+	if (!raw_tp) {
+		fd = -ENOMEM;
+		goto put_prog;
+	}
+
+	fd = bpf_raw_tracepoint_register(event, prog);
+	if (fd)
+		goto free_tracepoint;
+
+	raw_tp->event = event;
+	raw_tp->prog = prog;
+	fd = anon_inode_getfd("bpf-raw-tracepoint", &bpf_raw_tp_fops, raw_tp, O_CLOEXEC);
+	if (fd >= 0)
+		return fd;
+
+	bpf_raw_tracepoint_unregister(event, prog);
+free_tracepoint:
+	kfree(raw_tp);
+put_prog:
+	bpf_prog_put(prog);
+	return fd;
+}
+#endif
+
 SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
 {
 	union bpf_attr attr;
@@ -1211,6 +1287,11 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 	case BPF_OBJ_GET_INFO_BY_FD:
 		err = bpf_obj_get_info_by_fd(&attr, uattr);
 		break;
+#ifdef CONFIG_BPF_EVENTS
+	case BPF_RAW_TRACEPOINT_OPEN:
+		err = bpf_raw_tracepoint_open(&attr);
+		break;
+#endif
 
 #ifdef CONFIG_CGROUP_BPF
 	case BPF_PROG_ATTACH:
