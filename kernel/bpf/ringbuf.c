@@ -3,6 +3,8 @@
 #include <linux/capability.h>
 #include <linux/err.h>
 #include <linux/init.h>
+#include <linux/irq_work.h>
+#include <linux/filter.h>
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
@@ -15,6 +17,7 @@
 	(offsetof(struct bpf_ringbuf, consumer_pos) >> PAGE_SHIFT)
 /* consumer page and producer page */
 #define RINGBUF_POS_PAGES 2
+#define RINGBUF_MAX_RECORD_SZ (UINT_MAX / 4)
 
 /* Maximum size of ring buffer area is limited by 32-bit page offset within
  * record header, counted in pages. Reserve 8 bits for extensibility, and take
@@ -27,9 +30,11 @@
 
 struct bpf_ringbuf {
 	wait_queue_head_t waitq;
+	struct irq_work work;
 	u64 mask;
 	struct page **pages;
 	int nr_pages;
+	spinlock_t spinlock ____cacheline_aligned_in_smp;
 	/* Consumer and producer counters are put into separate pages to allow
 	 * mapping consumer page as r/w, but restrict producer page to r/o.
 	 * This protects producer position from being modified by user-space
@@ -37,12 +42,18 @@ struct bpf_ringbuf {
 	 */
 	unsigned long consumer_pos __aligned(PAGE_SIZE);
 	unsigned long producer_pos __aligned(PAGE_SIZE);
+	unsigned long pending_pos;
 	char data[] __aligned(PAGE_SIZE);
 };
 
 struct bpf_ringbuf_map {
 	struct bpf_map map;
 	struct bpf_ringbuf *rb;
+};
+
+struct bpf_ringbuf_hdr {
+	u32 len;
+	u32 pg_off;
 };
 
 static struct bpf_ringbuf *bpf_ringbuf_area_alloc(size_t data_sz)
@@ -106,6 +117,13 @@ err_free_pages:
 	return NULL;
 }
 
+static void bpf_ringbuf_notify(struct irq_work *work)
+{
+	struct bpf_ringbuf *rb = container_of(work, struct bpf_ringbuf, work);
+
+	wake_up_all(&rb->waitq);
+}
+
 static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 {
 	struct bpf_ringbuf_map *rb_map;
@@ -143,7 +161,9 @@ static struct bpf_map *ringbuf_map_alloc(union bpf_attr *attr)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	spin_lock_init(&rb_map->rb->spinlock);
 	init_waitqueue_head(&rb_map->rb->waitq);
+	init_irq_work(&rb_map->rb->work, bpf_ringbuf_notify);
 	rb_map->rb->mask = attr->max_entries - 1;
 	rb_map->map.max_entries = attr->max_entries;
 	rb_map->map.pages = DIV_ROUND_UP_ULL(cost, PAGE_SIZE);
@@ -158,6 +178,7 @@ static void bpf_ringbuf_free(struct bpf_ringbuf *rb)
 	struct page **pages = rb->pages;
 	int i, nr_pages = rb->nr_pages;
 
+	irq_work_sync(&rb->work);
 	vunmap(rb);
 	for (i = 0; i < nr_pages; i++)
 		__free_page(pages[i]);
@@ -168,6 +189,8 @@ static void ringbuf_map_free(struct bpf_map *map)
 {
 	struct bpf_ringbuf_map *rb_map;
 
+	/* Wait for in-flight BPF helper calls before freeing their pages. */
+	synchronize_rcu();
 	rb_map = container_of(map, struct bpf_ringbuf_map, map);
 	bpf_ringbuf_free(rb_map->rb);
 	kfree(rb_map);
@@ -263,3 +286,162 @@ static int __init ringbuf_map_init(void)
 	return 0;
 }
 late_initcall(ringbuf_map_init);
+
+/* Given pointer to ring buffer record metadata and struct bpf_ringbuf itself,
+ * calculate offset from record metadata to ring buffer in pages, rounded
+ * down. This page offset is stored as part of record metadata and allows to
+ * restore struct bpf_ringbuf * from record pointer. This page offset is
+ * stored at offset 4 of record metadata header.
+ */
+static size_t bpf_ringbuf_rec_pg_off(struct bpf_ringbuf *rb,
+				     struct bpf_ringbuf_hdr *hdr)
+{
+	return ((void *)hdr - (void *)rb) >> PAGE_SHIFT;
+}
+
+/* Given pointer to ring buffer record header, restore pointer to struct
+ * bpf_ringbuf itself by using page offset stored at offset 4
+ */
+static struct bpf_ringbuf *
+bpf_ringbuf_restore_from_rec(struct bpf_ringbuf_hdr *hdr)
+{
+	unsigned long addr = (unsigned long)(void *)hdr;
+	unsigned long off = (unsigned long)hdr->pg_off << PAGE_SHIFT;
+
+	return (void *)((addr & PAGE_MASK) - off);
+}
+
+static void *__bpf_ringbuf_reserve(struct bpf_ringbuf *rb, u64 size)
+{
+	unsigned long cons_pos, prod_pos, new_prod_pos, pend_pos, flags;
+	struct bpf_ringbuf_hdr *hdr;
+	u32 len, pg_off, tmp_size, hdr_len;
+
+	if (unlikely(size > RINGBUF_MAX_RECORD_SZ))
+		return NULL;
+
+	len = round_up(size + BPF_RINGBUF_HDR_SZ, 8);
+	if (len > rb->mask + 1)
+		return NULL;
+
+	cons_pos = smp_load_acquire(&rb->consumer_pos);
+
+	if (in_nmi()) {
+		if (!spin_trylock_irqsave(&rb->spinlock, flags))
+			return NULL;
+	} else {
+		spin_lock_irqsave(&rb->spinlock, flags);
+	}
+
+	pend_pos = rb->pending_pos;
+	prod_pos = rb->producer_pos;
+	new_prod_pos = prod_pos + len;
+
+	while (prod_pos - pend_pos > 0) {
+		hdr = (void *)rb->data + (pend_pos & rb->mask);
+		hdr_len = READ_ONCE(hdr->len);
+		if (hdr_len & BPF_RINGBUF_BUSY_BIT)
+			break;
+		tmp_size = hdr_len & ~BPF_RINGBUF_DISCARD_BIT;
+		tmp_size = round_up(tmp_size + BPF_RINGBUF_HDR_SZ, 8);
+		pend_pos += tmp_size;
+	}
+	rb->pending_pos = pend_pos;
+
+	/* check for out of ringbuf space:
+	 * - by ensuring producer position doesn't advance more than
+	 *   (ringbuf_size - 1) ahead
+	 * - by ensuring oldest not yet committed record until newest
+	 *   record does not span more than (ringbuf_size - 1)
+	 */
+	if (new_prod_pos - cons_pos > rb->mask ||
+	    new_prod_pos - pend_pos > rb->mask) {
+		spin_unlock_irqrestore(&rb->spinlock, flags);
+		return NULL;
+	}
+
+	hdr = (void *)rb->data + (prod_pos & rb->mask);
+	pg_off = bpf_ringbuf_rec_pg_off(rb, hdr);
+	hdr->len = size | BPF_RINGBUF_BUSY_BIT;
+	hdr->pg_off = pg_off;
+
+	/* pairs with consumer's smp_load_acquire() */
+	smp_store_release(&rb->producer_pos, new_prod_pos);
+
+	spin_unlock_irqrestore(&rb->spinlock, flags);
+
+	return (void *)hdr + BPF_RINGBUF_HDR_SZ;
+}
+
+BPF_CALL_3(bpf_ringbuf_reserve, struct bpf_map *, map, u64, size, u64, flags)
+{
+	struct bpf_ringbuf_map *rb_map;
+
+	if (unlikely(flags))
+		return 0;
+
+	rb_map = container_of(map, struct bpf_ringbuf_map, map);
+	return (unsigned long)__bpf_ringbuf_reserve(rb_map->rb, size);
+}
+
+const struct bpf_func_proto bpf_ringbuf_reserve_proto = {
+	.func		= bpf_ringbuf_reserve,
+	.ret_type	= RET_PTR_TO_RINGBUF_OR_NULL,
+	.arg1_type	= ARG_CONST_MAP_PTR,
+	.arg2_type	= ARG_CONST_RINGBUF_SIZE,
+	.arg3_type	= ARG_ANYTHING,
+};
+
+static void bpf_ringbuf_commit(void *sample, u64 flags, bool discard)
+{
+	unsigned long rec_pos, cons_pos;
+	struct bpf_ringbuf_hdr *hdr;
+	struct bpf_ringbuf *rb;
+	u32 new_len;
+
+	hdr = sample - BPF_RINGBUF_HDR_SZ;
+	rb = bpf_ringbuf_restore_from_rec(hdr);
+	new_len = hdr->len ^ BPF_RINGBUF_BUSY_BIT;
+	if (discard)
+		new_len |= BPF_RINGBUF_DISCARD_BIT;
+
+	/* update record header with correct final size prefix */
+	xchg(&hdr->len, new_len);
+
+	/* if consumer caught up and is waiting for our record, notify about
+	 * new data availability
+	 */
+	rec_pos = (void *)hdr - (void *)rb->data;
+	cons_pos = smp_load_acquire(&rb->consumer_pos) & rb->mask;
+
+	if (flags & BPF_RB_FORCE_WAKEUP)
+		irq_work_queue(&rb->work);
+	else if (cons_pos == rec_pos && !(flags & BPF_RB_NO_WAKEUP))
+		irq_work_queue(&rb->work);
+}
+
+BPF_CALL_2(bpf_ringbuf_submit, void *, sample, u64, flags)
+{
+	bpf_ringbuf_commit(sample, flags, false /* discard */);
+	return 0;
+}
+
+const struct bpf_func_proto bpf_ringbuf_submit_proto = {
+	.func		= bpf_ringbuf_submit,
+	.ret_type	= RET_VOID,
+	.arg1_type	= ARG_PTR_TO_RINGBUF_BASE,
+	.arg2_type	= ARG_ANYTHING,
+};
+
+BPF_CALL_2(bpf_ringbuf_discard, void *, sample, u64, flags)
+{
+	bpf_ringbuf_commit(sample, flags, true /* discard */);
+	return 0;
+}
+
+const struct bpf_func_proto bpf_ringbuf_discard_proto = {
+	.func		= bpf_ringbuf_discard,
+	.ret_type	= RET_VOID,
+	.arg1_type	= ARG_PTR_TO_RINGBUF_BASE,
+	.arg2_type	= ARG_ANYTHING,
+};

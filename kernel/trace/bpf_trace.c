@@ -118,7 +118,7 @@ static const struct bpf_func_proto bpf_probe_read_str_proto = {
 	.func           = bpf_probe_read_str,
 	.gpl_only       = true,
 	.ret_type       = RET_INTEGER,
-	.arg1_type	= ARG_PTR_TO_RAW_STACK,
+	.arg1_type	= ARG_PTR_TO_RAW_STACK_OR_RINGBUF,
 	.arg2_type	= ARG_CONST_STACK_SIZE,
 	.arg3_type	= ARG_ANYTHING,
 };
@@ -486,6 +486,12 @@ static const struct bpf_func_proto *tracing_func_proto(enum bpf_func_id func_id)
 		return &bpf_ktime_get_ns_proto;
 	case BPF_FUNC_ktime_get_boot_ns:
 		return &bpf_ktime_get_boot_ns_proto;
+	case BPF_FUNC_ringbuf_reserve:
+		return &bpf_ringbuf_reserve_proto;
+	case BPF_FUNC_ringbuf_submit:
+		return &bpf_ringbuf_submit_proto;
+	case BPF_FUNC_ringbuf_discard:
+		return &bpf_ringbuf_discard_proto;
 	case BPF_FUNC_tail_call:
 		return &bpf_tail_call_proto;
 	case BPF_FUNC_get_current_pid_tgid:

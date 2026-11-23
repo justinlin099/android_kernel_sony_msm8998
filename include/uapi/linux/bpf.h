@@ -588,9 +588,19 @@ enum bpf_func_id {
 
 	/* Includes time spent in suspend (CLOCK_BOOTTIME). */
 	BPF_FUNC_ktime_get_boot_ns = 125,
+	BPF_FUNC_ringbuf_reserve = 131,
+	BPF_FUNC_ringbuf_submit = 132,
+	BPF_FUNC_ringbuf_discard = 133,
 
 	__BPF_FUNC_MAX_ID,
 };
+
+/* Ring buffer wakeup flags and record header bits. */
+#define BPF_RB_NO_WAKEUP	(1ULL << 0)
+#define BPF_RB_FORCE_WAKEUP	(1ULL << 1)
+#define BPF_RINGBUF_BUSY_BIT	(1U << 31)
+#define BPF_RINGBUF_DISCARD_BIT	(1U << 30)
+#define BPF_RINGBUF_HDR_SZ	8
 
 /* All flags used by eBPF helper functions, placed here. */
 

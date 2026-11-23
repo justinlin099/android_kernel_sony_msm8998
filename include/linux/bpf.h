@@ -99,6 +99,9 @@ enum bpf_arg_type {
 
 	ARG_PTR_TO_CTX,		/* pointer to context */
 	ARG_ANYTHING,		/* any (initialized) argument is ok */
+	ARG_CONST_RINGBUF_SIZE,	/* constant size of the reservation */
+	ARG_PTR_TO_RINGBUF_BASE,	/* non-null, unadjusted reservation */
+	ARG_PTR_TO_RAW_STACK_OR_RINGBUF,	/* memory initialized by the helper */
 };
 
 /* type of values returned from helper functions */
@@ -106,6 +109,7 @@ enum bpf_return_type {
 	RET_INTEGER,			/* function returns integer */
 	RET_VOID,			/* function doesn't return anything */
 	RET_PTR_TO_MAP_VALUE_OR_NULL,	/* returns a pointer to map elem value or NULL */
+	RET_PTR_TO_RINGBUF_OR_NULL,
 };
 
 /* eBPF function prototype used by verifier to allow BPF_CALLs from eBPF programs
@@ -165,6 +169,8 @@ enum bpf_reg_type {
 	 * map element.
 	 */
 	PTR_TO_MAP_VALUE_ADJ,
+	PTR_TO_RINGBUF,
+	PTR_TO_RINGBUF_OR_NULL,
 };
 
 struct bpf_prog;
@@ -307,6 +313,9 @@ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
 void bpf_register_map_type(struct bpf_map_type_list *tl);
 
 bool bpf_is_map_file(const struct file *file);
+extern const struct bpf_func_proto bpf_ringbuf_reserve_proto;
+extern const struct bpf_func_proto bpf_ringbuf_submit_proto;
+extern const struct bpf_func_proto bpf_ringbuf_discard_proto;
 extern const struct file_operations bpf_prog_fops;
 
 struct bpf_prog *bpf_prog_get(u32 ufd);

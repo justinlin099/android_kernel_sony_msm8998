@@ -32,6 +32,12 @@ struct bpf_reg_state {
 		 *   PTR_TO_MAP_VALUE_OR_NULL
 		 */
 		struct bpf_map *map_ptr;
+
+		/* valid for a ring buffer reservation or an alias into it */
+		struct {
+			u32 ring_size;
+			s32 ring_off;
+		};
 	};
 	u32 id;
 	/* Used to determine if any memory access using this register will
@@ -50,6 +56,7 @@ enum bpf_stack_slot_type {
 };
 
 #define BPF_REG_SIZE 8	/* size of eBPF register in bytes */
+#define BPF_MAX_RING_REFS (MAX_BPF_REG + MAX_BPF_STACK / BPF_REG_SIZE)
 
 /* state of the program:
  * type of all registers and stack info
@@ -58,6 +65,8 @@ struct bpf_verifier_state {
 	struct bpf_reg_state regs[MAX_BPF_REG];
 	u8 stack_slot_type[MAX_BPF_STACK];
 	struct bpf_reg_state spilled_regs[MAX_BPF_STACK / BPF_REG_SIZE];
+	u32 ring_refs[BPF_MAX_RING_REFS];
+	u8 nr_ring_refs;
 };
 
 /* linked list of verifier states used to prune search */
