@@ -26,13 +26,14 @@
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
 #include <linux/fence.h>
-#include <linux/anon_inodes.h>
+#include <linux/mount.h>
 #include <linux/export.h>
 #include <linux/debugfs.h>
 #include <linux/module.h>
 #include <linux/seq_file.h>
 #include <linux/poll.h>
 #include <linux/reservation.h>
+#include <uapi/linux/magic.h>
 
 #ifdef CONFIG_DMABUF_HEAPS
 #include <linux/compat.h>
@@ -49,6 +50,24 @@ struct dma_buf_list {
 };
 
 static struct dma_buf_list db_list;
+static struct vfsmount *dma_buf_mnt;
+
+static const struct dentry_operations dma_buf_dentry_ops = {
+	.d_dname = simple_dname,
+};
+
+static struct dentry *dma_buf_fs_mount(struct file_system_type *fs_type,
+				     int flags, const char *name, void *data)
+{
+	return mount_pseudo(fs_type, "dmabuf:", NULL, &dma_buf_dentry_ops,
+			    DMA_BUF_MAGIC);
+}
+
+static struct file_system_type dma_buf_fs_type = {
+	.name		= "dmabuf",
+	.mount		= dma_buf_fs_mount,
+	.kill_sb	= kill_anon_super,
+};
 
 static int dma_buf_release(struct inode *inode, struct file *file)
 {
@@ -311,7 +330,19 @@ static long dma_buf_compat_ioctl(struct file *file, unsigned int cmd,
 #endif
 #endif
 
+static void dma_buf_show_fdinfo(struct seq_file *m, struct file *file)
+{
+	struct dma_buf *dmabuf = file->private_data;
+
+	seq_printf(m, "size:\t%zu\n", dmabuf->size);
+	/* The fdinfo reader itself holds a temporary reference. */
+	seq_printf(m, "count:\t%ld\n", file_count(file) - 1);
+	seq_printf(m, "exp_name:\t%s\n", dmabuf->exp_name);
+	seq_printf(m, "ino:\t%lu\n", file_inode(file)->i_ino);
+}
+
 static const struct file_operations dma_buf_fops = {
+	.show_fdinfo	= dma_buf_show_fdinfo,
 	.release	= dma_buf_release,
 	.mmap		= dma_buf_mmap_internal,
 	.llseek		= dma_buf_llseek,
@@ -330,6 +361,44 @@ static const struct file_operations dma_buf_fops = {
 static inline int is_dma_buf_file(struct file *file)
 {
 	return file->f_op == &dma_buf_fops;
+}
+
+static struct file *dma_buf_getfile(struct dma_buf *dmabuf, int flags)
+{
+	static const struct qstr name = QSTR_INIT("dmabuf", 6);
+	struct inode *inode;
+	struct path path;
+	struct file *file;
+
+	if (IS_ERR_OR_NULL(dma_buf_mnt))
+		return ERR_PTR(-ENODEV);
+
+	inode = alloc_anon_inode(dma_buf_mnt->mnt_sb);
+	if (IS_ERR(inode))
+		return ERR_CAST(inode);
+
+	i_size_write(inode, dmabuf->size);
+	inode_set_bytes(inode, dmabuf->size);
+
+	path.dentry = d_alloc_pseudo(dma_buf_mnt->mnt_sb, &name);
+	if (!path.dentry) {
+		iput(inode);
+		return ERR_PTR(-ENOMEM);
+	}
+	path.mnt = mntget(dma_buf_mnt);
+	d_instantiate(path.dentry, inode);
+
+	file = alloc_file(&path, OPEN_FMODE(flags) | FMODE_LSEEK,
+			  &dma_buf_fops);
+	if (IS_ERR(file)) {
+		/* The dentry holds the inode reference after d_instantiate(). */
+		path_put(&path);
+		return file;
+	}
+
+	file->f_flags = flags & (O_ACCMODE | O_NONBLOCK);
+	file->private_data = dmabuf;
+	return file;
 }
 
 /**
@@ -395,14 +464,15 @@ struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info)
 	}
 	dmabuf->resv = resv;
 
-	file = anon_inode_getfile("dmabuf", &dma_buf_fops, dmabuf,
-					exp_info->flags);
+	file = dma_buf_getfile(dmabuf, exp_info->flags);
 	if (IS_ERR(file)) {
+		if (resv == (struct reservation_object *)&dmabuf[1])
+			reservation_object_fini(resv);
 		kfree(dmabuf);
+		module_put(exp_info->owner);
 		return ERR_CAST(file);
 	}
 
-	file->f_mode |= FMODE_LSEEK;
 	dmabuf->file = file;
 
 	mutex_init(&dmabuf->lock);
@@ -858,7 +928,7 @@ static int dma_buf_describe(struct seq_file *s)
 		return ret;
 
 	seq_puts(s, "\nDma-buf Objects:\n");
-	seq_puts(s, "size\tflags\tmode\tcount\texp_name\n");
+	seq_puts(s, "size\tflags\tmode\tcount\texp_name\tino\n");
 
 	list_for_each_entry(buf_obj, &db_list.head, list_node) {
 		ret = mutex_lock_interruptible(&buf_obj->lock);
@@ -869,11 +939,11 @@ static int dma_buf_describe(struct seq_file *s)
 			continue;
 		}
 
-		seq_printf(s, "%08zu\t%08x\t%08x\t%08ld\t%s\n",
+		seq_printf(s, "%08zu\t%08x\t%08x\t%08ld\t%s\t%08lu\n",
 				buf_obj->size,
 				buf_obj->file->f_flags, buf_obj->file->f_mode,
 				file_count(buf_obj->file),
-				buf_obj->exp_name);
+				buf_obj->exp_name, file_inode(buf_obj->file)->i_ino);
 
 		seq_puts(s, "\tAttached Devices:\n");
 		attach_count = 0;
@@ -969,6 +1039,10 @@ static inline void dma_buf_uninit_debugfs(void)
 
 static int __init dma_buf_init(void)
 {
+	dma_buf_mnt = kern_mount(&dma_buf_fs_type);
+	if (IS_ERR(dma_buf_mnt))
+		return PTR_ERR(dma_buf_mnt);
+
 	mutex_init(&db_list.lock);
 	INIT_LIST_HEAD(&db_list.head);
 	dma_buf_init_debugfs();
@@ -979,5 +1053,6 @@ subsys_initcall(dma_buf_init);
 static void __exit dma_buf_deinit(void)
 {
 	dma_buf_uninit_debugfs();
+	kern_unmount(dma_buf_mnt);
 }
 __exitcall(dma_buf_deinit);
