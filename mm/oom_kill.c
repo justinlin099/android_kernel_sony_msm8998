@@ -33,6 +33,7 @@
 #include <linux/security.h>
 #include <linux/ptrace.h>
 #include <linux/freezer.h>
+#include <linux/cred.h>
 #include <linux/ftrace.h>
 #include <linux/ratelimit.h>
 
@@ -428,6 +429,10 @@ void mark_oom_victim(struct task_struct *tsk)
 	 */
 	__thaw_task(tsk);
 	atomic_inc(&oom_victims);
+
+	/* Callers hold task_lock() for other tasks; current owns its mm. */
+	if (trace_mark_victim_enabled() && tsk->mm)
+		trace_mark_victim(tsk, __kuid_val(task_uid(tsk)));
 }
 
 /**
