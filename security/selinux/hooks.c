@@ -6107,8 +6107,10 @@ static int bpf_fd_pass(struct file *file, u32 sid)
 				   bpf_map_fmode_to_av(file->f_mode), NULL);
 		if (ret)
 			return ret;
-	} else if (file->f_op == &bpf_prog_fops) {
-		prog = file->private_data;
+	} else {
+		prog = bpf_file_prog(file);
+		if (!prog)
+			return 0;
 		bpfsec = prog->aux->security;
 		ret = avc_has_perm(sid, bpfsec->sid, SECCLASS_BPF,
 				   BPF__PROG_RUN, NULL);

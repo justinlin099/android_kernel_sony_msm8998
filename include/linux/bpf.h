@@ -313,6 +313,25 @@ void bpf_register_prog_type(struct bpf_prog_type_list *tl);
 void bpf_register_map_type(struct bpf_map_type_list *tl);
 
 bool bpf_is_map_file(const struct file *file);
+struct bpf_prog *bpf_file_prog(const struct file *file);
+
+struct bpf_link;
+struct bpf_link_ops {
+	void (*release)(struct bpf_link *link);
+	void (*dealloc)(struct bpf_link *link);
+};
+
+struct bpf_link {
+	atomic_t refcnt;
+	struct work_struct work;
+	const struct bpf_link_ops *ops;
+	struct bpf_prog *prog;
+};
+
+struct bpf_link *bpf_link_inc(struct bpf_link *link);
+void bpf_link_put(struct bpf_link *link);
+int bpf_link_new_fd(struct bpf_link *link);
+struct bpf_link *bpf_link_get_from_fd(u32 ufd);
 
 #ifdef CONFIG_BPF_EVENTS
 struct bpf_raw_event_map;

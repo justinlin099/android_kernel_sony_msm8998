@@ -1157,24 +1157,119 @@ static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
 	return err;
 }
 
-#ifdef CONFIG_BPF_EVENTS
-struct bpf_raw_tracepoint {
-	const struct bpf_raw_event_map *event;
-	struct bpf_prog *prog;
-};
-
-static int bpf_raw_tracepoint_release(struct inode *inode, struct file *filp)
+static void bpf_link_free(struct bpf_link *link)
 {
-	struct bpf_raw_tracepoint *raw_tp = filp->private_data;
+	link->ops->release(link);
+	bpf_prog_put(link->prog);
+	link->ops->dealloc(link);
+}
 
-	bpf_raw_tracepoint_unregister(raw_tp->event, raw_tp->prog);
-	bpf_prog_put(raw_tp->prog);
-	kfree(raw_tp);
+static void bpf_link_free_deferred(struct work_struct *work)
+{
+	struct bpf_link *link = container_of(work, struct bpf_link, work);
+
+	bpf_link_free(link);
+}
+
+struct bpf_link *bpf_link_inc(struct bpf_link *link)
+{
+	if (atomic_inc_return(&link->refcnt) > BPF_MAX_REFCNT) {
+		atomic_dec(&link->refcnt);
+		return ERR_PTR(-EBUSY);
+	}
+	return link;
+}
+
+void bpf_link_put(struct bpf_link *link)
+{
+	if (!atomic_dec_and_test(&link->refcnt))
+		return;
+
+	if (in_atomic() || irqs_disabled()) {
+		schedule_work(&link->work);
+		return;
+	}
+	bpf_link_free(link);
+}
+
+static int bpf_link_release(struct inode *inode, struct file *filp)
+{
+	bpf_link_put(filp->private_data);
 	return 0;
 }
 
-static const struct file_operations bpf_raw_tp_fops = {
+static const struct file_operations bpf_link_fops = {
+	.release = bpf_link_release,
+};
+
+struct bpf_prog *bpf_file_prog(const struct file *file)
+{
+	struct bpf_link *link;
+
+	if (file->f_op == &bpf_prog_fops)
+		return file->private_data;
+	if (file->f_op == &bpf_link_fops) {
+		link = file->private_data;
+		return link->prog;
+	}
+	return NULL;
+}
+
+struct bpf_link *bpf_link_get_from_fd(u32 ufd)
+{
+	struct bpf_link *link;
+	struct fd f = fdget(ufd);
+	int err;
+
+	if (!f.file)
+		return ERR_PTR(-EBADF);
+
+	if (f.file->f_op != &bpf_link_fops) {
+		link = ERR_PTR(-EINVAL);
+		goto out;
+	}
+
+	link = f.file->private_data;
+	err = security_bpf_prog(link->prog);
+	if (err < 0)
+		link = ERR_PTR(err);
+	else
+		link = bpf_link_inc(link);
+out:
+	fdput(f);
+	return link;
+}
+
+int bpf_link_new_fd(struct bpf_link *link)
+{
+	int err = security_bpf_prog(link->prog);
+
+	if (err < 0)
+		return err;
+	return anon_inode_getfd("bpf-link", &bpf_link_fops, link, O_CLOEXEC);
+}
+
+#ifdef CONFIG_BPF_EVENTS
+struct bpf_raw_tracepoint {
+	struct bpf_link link;
+	const struct bpf_raw_event_map *event;
+};
+
+static void bpf_raw_tracepoint_release(struct bpf_link *link)
+{
+	struct bpf_raw_tracepoint *raw_tp = container_of(link, struct bpf_raw_tracepoint, link);
+
+	bpf_raw_tracepoint_unregister(raw_tp->event, link->prog);
+}
+
+static void bpf_raw_tracepoint_dealloc(struct bpf_link *link)
+{
+	kfree(container_of(link, struct bpf_raw_tracepoint, link));
+}
+
+static const struct bpf_link_ops bpf_raw_tracepoint_link_ops = {
 	.release = bpf_raw_tracepoint_release,
+	.dealloc = bpf_raw_tracepoint_dealloc,
 };
 
 #define BPF_RAW_TRACEPOINT_OPEN_LAST_FIELD raw_tracepoint.prog_fd
@@ -1219,12 +1314,16 @@ static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
 		goto free_tracepoint;
 
 	raw_tp->event = event;
-	raw_tp->prog = prog;
-	fd = anon_inode_getfd("bpf-raw-tracepoint", &bpf_raw_tp_fops, raw_tp, O_CLOEXEC);
-	if (fd >= 0)
-		return fd;
+	raw_tp->link.prog = prog;
+	raw_tp->link.ops = &bpf_raw_tracepoint_link_ops;
+	atomic_set(&raw_tp->link.refcnt, 1);
+	INIT_WORK(&raw_tp->link.work, bpf_link_free_deferred);
 
-	bpf_raw_tracepoint_unregister(event, prog);
+	fd = bpf_link_new_fd(&raw_tp->link);
+	if (fd < 0)
+		bpf_link_put(&raw_tp->link);
+	return fd;
+
 free_tracepoint:
 	kfree(raw_tp);
 put_prog:
