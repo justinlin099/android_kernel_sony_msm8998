@@ -1053,6 +1053,73 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 }
 #endif /* CONFIG_CGROUP_BPF */
 
+static int bpf_check_uarg_tail_zero(const void __user *uarg, u32 known_size,
+				   u32 size)
+{
+	const unsigned char __user *bytes = uarg;
+	unsigned char value;
+	int err;
+
+	if (size > PAGE_SIZE)
+		return -E2BIG;
+	for (; known_size < size; known_size++) {
+		err = get_user(value, bytes + known_size);
+		if (err)
+			return err;
+		if (value)
+			return -E2BIG;
+	}
+	return 0;
+}
+
+static int bpf_map_get_info_by_fd(struct bpf_map *map,
+				  const union bpf_attr *attr,
+				  union bpf_attr __user *uattr)
+{
+	struct bpf_map_info __user *uinfo = u64_to_user_ptr(attr->info.info);
+	struct bpf_map_info info = {};
+	u32 info_len = attr->info.info_len;
+	int err;
+
+	err = bpf_check_uarg_tail_zero(uinfo, sizeof(info), info_len);
+	if (err)
+		return err;
+	info_len = min_t(u32, sizeof(info), info_len);
+	info.type = map->map_type;
+	info.id = map->id;
+	info.key_size = map->key_size;
+	info.value_size = map->value_size;
+	info.max_entries = map->max_entries;
+	info.map_flags = map->map_flags;
+
+	if (copy_to_user(uinfo, &info, info_len) ||
+	    put_user(info_len, &uattr->info.info_len))
+		return -EFAULT;
+	return 0;
+}
+
+#define BPF_OBJ_GET_INFO_BY_FD_LAST_FIELD info.info
+
+static int bpf_obj_get_info_by_fd(const union bpf_attr *attr,
+				  union bpf_attr __user *uattr)
+{
+	struct bpf_map *map;
+	struct fd f;
+	int err;
+
+	if (CHECK_ATTR(BPF_OBJ_GET_INFO_BY_FD))
+		return -EINVAL;
+
+	f = fdget(attr->info.bpf_fd);
+	map = __bpf_map_get(f);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+
+	err = bpf_map_get_info_by_fd(map, attr, uattr);
+	fdput(f);
+	return err;
+}
+
 SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
 {
 	union bpf_attr attr;
@@ -1064,31 +1131,11 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 	if (!access_ok(VERIFY_READ, uattr, 1))
 		return -EFAULT;
 
-	if (size > PAGE_SIZE)	/* silly large */
-		return -E2BIG;
-
-	/* If we're handed a bigger struct than we know of,
-	 * ensure all the unknown bits are 0 - i.e. new
-	 * user-space does not rely on any kernel feature
-	 * extensions we dont know about yet.
-	 */
-	if (size > sizeof(attr)) {
-		unsigned char __user *addr;
-		unsigned char __user *end;
-		unsigned char val;
-
-		addr = (void __user *)uattr + sizeof(attr);
-		end  = (void __user *)uattr + size;
-
-		for (; addr < end; addr++) {
-			err = get_user(val, addr);
-			if (err)
-				return err;
-			if (val)
-				return -E2BIG;
-		}
-		size = sizeof(attr);
-	}
+	/* A larger attribute is safe only when unknown fields are zero. */
+	err = bpf_check_uarg_tail_zero(uattr, sizeof(attr), size);
+	if (err)
+		return err;
+	size = min_t(u32, size, sizeof(attr));
 
 	/* copy attributes from user space, may be less than sizeof(bpf_attr) */
 	memset(&attr, 0, sizeof(attr));
@@ -1123,6 +1170,9 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
 		break;
 	case BPF_OBJ_GET:
 		err = bpf_obj_get(&attr);
+		break;
+	case BPF_OBJ_GET_INFO_BY_FD:
+		err = bpf_obj_get_info_by_fd(&attr, uattr);
 		break;
 
 #ifdef CONFIG_CGROUP_BPF
