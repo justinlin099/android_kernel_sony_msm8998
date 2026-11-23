@@ -1,12 +1,27 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <crypto/hash.h>
+#include <crypto/sha.h>
 #include <linux/bpf.h>
+#include <linux/cache.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kobject.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
 #include <linux/sysfs.h>
+#include <linux/vmalloc.h>
+#include <linux/xz.h>
 
-extern const char __start_BTF[];
-extern const char __stop_BTF[];
+struct btf_initramfs_ref {
+	u32 raw_size;
+	u32 compressed_size;
+	u8 sha256[SHA256_DIGEST_SIZE];
+};
+
+extern const struct btf_initramfs_ref __start_BTF_ref;
+
+static const char *vmlinux_btf __ro_after_init;
+static u32 vmlinux_btf_size __ro_after_init;
 
 #ifdef CONFIG_BPF_DMABUF_ITER
 /* BTF v1 records in the native-endian image produced by pahole. */
@@ -61,8 +76,8 @@ static int btf_type_tail_size(u32 kind, u32 vlen)
 
 u32 bpf_vmlinux_btf_func_id(const char *name)
 {
-	const struct vmlinux_btf_header *header = (const void *)__start_BTF;
-	size_t size = __stop_BTF - __start_BTF, name_len = strlen(name) + 1;
+	const struct vmlinux_btf_header *header = (const void *)vmlinux_btf;
+	size_t size = vmlinux_btf_size, name_len = strlen(name) + 1;
 	const char *type, *end, *strings;
 	u32 id;
 
@@ -74,9 +89,9 @@ u32 bpf_vmlinux_btf_func_id(const char *name)
 	    (u64)header->header_len + header->string_offset + header->string_len > size)
 		return 0;
 
-	type = __start_BTF + header->header_len + header->type_offset;
+	type = vmlinux_btf + header->header_len + header->type_offset;
 	end = type + header->type_len;
-	strings = __start_BTF + header->header_len + header->string_offset;
+	strings = vmlinux_btf + header->header_len + header->string_offset;
 	for (id = 1; end - type >= sizeof(struct vmlinux_btf_type); id++) {
 		const struct vmlinux_btf_type *record = (const void *)type;
 		u32 kind = (record->info >> 24) & 0x1f;
@@ -98,7 +113,7 @@ static ssize_t btf_vmlinux_read(struct file *file, struct kobject *kobj,
 				struct bin_attribute *attr, char *buf,
 				loff_t offset, size_t count)
 {
-	return memory_read_from_buffer(buf, count, &offset, __start_BTF, attr->size);
+	return memory_read_from_buffer(buf, count, &offset, vmlinux_btf, attr->size);
 }
 
 static struct bin_attribute btf_vmlinux = {
@@ -106,22 +121,132 @@ static struct bin_attribute btf_vmlinux = {
 	.read = btf_vmlinux_read,
 };
 
-static int __init btf_sysfs_init(void)
+static int __init btf_verify_digest(const char *buffer, u32 size,
+				   const u8 *expected)
 {
-	struct kobject *kobj;
+	struct crypto_shash *tfm;
+	struct shash_desc *desc;
+	u8 digest[SHA256_DIGEST_SIZE];
 	int err;
 
-	btf_vmlinux.size = __stop_BTF - __start_BTF;
-	if (!btf_vmlinux.size)
+	tfm = crypto_alloc_shash("sha256", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+
+	desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_KERNEL);
+	if (!desc) {
+		err = -ENOMEM;
+		goto out;
+	}
+	desc->tfm = tfm;
+	desc->flags = 0;
+	err = crypto_shash_digest(desc, buffer, size, digest);
+	if (!err && memcmp(digest, expected, sizeof(digest)))
+		err = -EBADMSG;
+	kfree(desc);
+out:
+	crypto_free_shash(tfm);
+	return err;
+}
+
+static int __init btf_read_initramfs(void *encoded, u32 size)
+{
+	struct file *file;
+	loff_t position = 0;
+	int err = 0;
+
+	file = filp_open("/.lilac-vmlinux.btf.xz", O_RDONLY | O_NOFOLLOW, 0);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	if (!S_ISREG(file_inode(file)->i_mode) ||
+	    i_size_read(file_inode(file)) != size) {
+		err = -EINVAL;
+		goto close;
+	}
+	while (position < size) {
+		ssize_t read = kernel_read(file, (char *)encoded + position,
+					   size - position, &position);
+
+		if (read <= 0) {
+			err = read ? read : -EIO;
+			break;
+		}
+	}
+close:
+	filp_close(file, NULL);
+	return err;
+}
+
+static int __init btf_sysfs_init(void)
+{
+	const struct btf_initramfs_ref *ref = &__start_BTF_ref;
+	struct xz_dec *decoder;
+	struct kobject *kobj;
+	struct xz_buf stream;
+	void *encoded;
+	void *buffer;
+	enum xz_ret result;
+	int err;
+
+	if (!ref->raw_size || ref->raw_size > SZ_64M ||
+	    !ref->compressed_size || ref->compressed_size > ref->raw_size)
 		return -EINVAL;
 
-	kobj = kobject_create_and_add("btf", kernel_kobj);
-	if (!kobj)
+	encoded = vmalloc(ref->compressed_size);
+	if (!encoded)
 		return -ENOMEM;
-
-	err = sysfs_create_bin_file(kobj, &btf_vmlinux);
+	err = btf_read_initramfs(encoded, ref->compressed_size);
 	if (err)
-		kobject_put(kobj);
+		goto free_encoded;
+
+	buffer = vmalloc(ref->raw_size);
+	if (!buffer) {
+		err = -ENOMEM;
+		goto free_encoded;
+	}
+	decoder = xz_dec_init(XZ_SINGLE, 0);
+	if (!decoder) {
+		err = -ENOMEM;
+		goto free_buffer;
+	}
+	stream = (struct xz_buf) {
+		.in = encoded,
+		.in_size = ref->compressed_size,
+		.out = buffer,
+		.out_size = ref->raw_size,
+	};
+	result = xz_dec_run(decoder, &stream);
+	xz_dec_end(decoder);
+	if (result != XZ_STREAM_END || stream.in_pos != stream.in_size ||
+	    stream.out_pos != ref->raw_size) {
+		err = -EINVAL;
+		goto free_buffer;
+	}
+	err = btf_verify_digest(buffer, ref->raw_size, ref->sha256);
+	if (err)
+		goto free_buffer;
+
+	kobj = kobject_create_and_add("btf", kernel_kobj);
+	if (!kobj) {
+		err = -ENOMEM;
+		goto free_buffer;
+	}
+	vmlinux_btf = buffer;
+	vmlinux_btf_size = ref->raw_size;
+	btf_vmlinux.size = ref->raw_size;
+	err = sysfs_create_bin_file(kobj, &btf_vmlinux);
+	if (!err)
+		goto free_encoded;
+
+	vmlinux_btf = NULL;
+	vmlinux_btf_size = 0;
+	kobject_put(kobj);
+free_buffer:
+	vfree(buffer);
+free_encoded:
+	vfree(encoded);
+	if (err)
+		pr_err("BPF: cannot publish initramfs BTF: %d\n", err);
 	return err;
 }
 late_initcall(btf_sysfs_init);

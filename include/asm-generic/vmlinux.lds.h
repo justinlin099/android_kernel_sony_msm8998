@@ -265,13 +265,15 @@
  */
 #ifdef CONFIG_DEBUG_INFO_BTF
 #define BTF_DATA()							\
-	.BTF : AT(ADDR(.BTF) - LOAD_OFFSET) {				\
-		VMLINUX_SYMBOL(__start_BTF) = .;				\
-		KEEP(*(.BTF))						\
-		VMLINUX_SYMBOL(__stop_BTF) = .;				\
+	.BTF.ref : AT(ADDR(.BTF.ref) - LOAD_OFFSET) {			\
+		VMLINUX_SYMBOL(__start_BTF_ref) = .;			\
+		KEEP(*(.BTF.ref))					\
 	}
+#define BTF_DEBUG_DATA()						\
+	.BTF 0 : { KEEP(*(.BTF)) }
 #else
 #define BTF_DATA()
+#define BTF_DEBUG_DATA()
 #endif
 
 #define RO_DATA_SECTION(align)						\

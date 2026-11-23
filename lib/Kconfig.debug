@@ -134,6 +134,9 @@ config DEBUG_INFO_BTF
 	bool "Generate BTF type information from DWARF"
 	depends on BPF_SYSCALL && SYSFS && DEBUG_INFO
 	depends on !DEBUG_INFO_REDUCED && !DEBUG_INFO_SPLIT && !UML
+	select XZ_DEC
+	select CRYPTO
+	select CRYPTO_SHA256
 	help
 	  Encode kernel type information with pahole and expose it read-only
 	  in /sys/kernel/btf/vmlinux for BPF CO-RE programs.

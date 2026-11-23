@@ -155,9 +155,16 @@ gen_btf()
 		--skip_encoding_btf_enum64 --skip_encoding_btf_decl_tag \
 		--skip_encoding_btf_type_tag .tmp_vmlinux_for_btf
 	test -s .tmp_vmlinux.btf
-	printf '%s\n' '.section .BTF,"a"' '.balign 4' \
-		'.incbin ".tmp_vmlinux.btf"' |
-		CCACHE_DISABLE=1 ${CC} ${KBUILD_AFLAGS} ${KBUILD_AFLAGS_KERNEL} \
+	local btf_size encoded_size btf_digest
+	btf_size=$(wc -c < .tmp_vmlinux.btf)
+	xz --compress --stdout --check=crc32 -6 .tmp_vmlinux.btf > vmlinux.btf.xz
+	encoded_size=$(wc -c < vmlinux.btf.xz)
+	btf_digest=$(sha256sum .tmp_vmlinux.btf | cut -d' ' -f1 | \
+		sed 's/../0x&,/g; s/,$//')
+	printf '%s\n' '.section .BTF,""' '.incbin ".tmp_vmlinux.btf"' \
+		'.section .BTF.ref,"a"' '.balign 4' \
+		".long $btf_size, $encoded_size" ".byte $btf_digest" |
+		CCACHE_DISABLE=1 $CC $KBUILD_AFLAGS $KBUILD_AFLAGS_KERNEL \
 			-c -x assembler -o .tmp_vmlinux_btf.o -
 	rm -f .tmp_vmlinux_for_btf .tmp_vmlinux.btf
 }
